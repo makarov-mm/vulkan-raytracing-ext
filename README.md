@@ -26,6 +26,11 @@ with raw Win32 (no GLFW) and all math is inline (no GLM).
   everything else melts into bokeh, accumulated across samples and TAA) and an
   ACES filmic tone-map over a linear-HDR pipeline, so emissive surfaces and the
   light keep a hot coloured core instead of clipping to flat white.
+- **Spatial denoiser** — an edge-avoiding a-trous wavelet filter (SVGF-style) runs
+  as a set of compute passes after the temporal pass, guided by a normal/depth
+  buffer so it smooths noise without bleeding across geometry or shadow edges.
+  Combined with the temporal accumulation this keeps the always-animating scene
+  clean at a handful of samples per pixel.
 - **Reflections** — traced iteratively from the ray-gen shader, so
   `maxPipelineRayRecursionDepth = 1`, which every RT-capable GPU supports.
 - **Temporal reprojection (TAA) + anti-aliasing** — each frame casts several

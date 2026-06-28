@@ -288,6 +288,20 @@ private:
     VkDeviceMemory histMem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView    histView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
+    // ---- Denoiser: ping-pong colour (rgba32f) + guide (xyz normal, w depth) ----
+    VkImage        denImg[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory denMem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView    denView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImage        guideImg = VK_NULL_HANDLE;
+    VkDeviceMemory guideMem = VK_NULL_HANDLE;
+    VkImageView    guideView = VK_NULL_HANDLE;
+    int            atrousPasses = 3;   // 0 = denoiser off (tone-map only), 3 = full
+
+    VkDescriptorSetLayout compDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet       compSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout      compPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            compPipeline = VK_NULL_HANDLE;
+
     // Previous-frame camera state for reprojection.
     Mat4 prevViewProj{};
     Vec3 prevCamPos{};
@@ -407,6 +421,7 @@ private:
         createDescriptors();
         createRayTracingPipeline();
         createShaderBindingTable();
+        createComputePipeline();
         startTime = std::chrono::high_resolution_clock::now();
     }
 
@@ -1138,6 +1153,46 @@ private:
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
             endOneShot(c);
         }
+
+        // ---- Denoiser images (float, GENERAL): two colour buffers + one guide ----
+        VkImage* dimgs[3] = { &denImg[0], &denImg[1], &guideImg };
+        VkDeviceMemory* dmems[3] = { &denMem[0], &denMem[1], &guideMem };
+        VkImageView* dviews[3] = { &denView[0], &denView[1], &guideView };
+        for (int i = 0; i < 3; ++i) {
+            VkImageCreateInfo dci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+            dci.imageType = VK_IMAGE_TYPE_2D;
+            dci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            dci.extent = { swapExtent.width, swapExtent.height, 1 };
+            dci.mipLevels = 1;
+            dci.arrayLayers = 1;
+            dci.samples = VK_SAMPLE_COUNT_1_BIT;
+            dci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            dci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+            dci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            vkCheck(vkCreateImage(dev, &dci, nullptr, dimgs[i]), "create denoise image");
+
+            VkMemoryRequirements dreq;
+            vkGetImageMemoryRequirements(dev, *dimgs[i], &dreq);
+            VkMemoryAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            dai.allocationSize = dreq.size;
+            dai.memoryTypeIndex = findMemoryType(dreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vkCheck(vkAllocateMemory(dev, &dai, nullptr, dmems[i]), "alloc denoise image");
+            vkBindImageMemory(dev, *dimgs[i], *dmems[i], 0);
+
+            VkImageViewCreateInfo dvci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            dvci.image = *dimgs[i];
+            dvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            dvci.format = dci.format;
+            dvci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCheck(vkCreateImageView(dev, &dvci, nullptr, dviews[i]), "denoise view");
+
+            VkCommandBuffer c = beginOneShot();
+            imageBarrier(c, *dimgs[i],
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+            endOneShot(c);
+        }
     }
 
     void createUniformBuffer() {
@@ -1149,7 +1204,7 @@ private:
     //  Descriptors
     // -------------------------------------------------------------------------
     void createDescriptors() {
-        std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
@@ -1157,20 +1212,32 @@ private:
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr };
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
+        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
 
         VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         lci.bindingCount = (uint32_t)bindings.size();
         lci.pBindings = bindings.data();
         vkCheck(vkCreateDescriptorSetLayout(dev, &lci, nullptr, &descLayout), "descriptor layout");
 
+        // Compute (denoiser) layout: colorIn, colorOut, guide, outLDR + push constant.
+        std::array<VkDescriptorSetLayoutBinding, 4> cb{};
+        cb[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        cb[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        cb[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        cb[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        VkDescriptorSetLayoutCreateInfo clci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        clci.bindingCount = (uint32_t)cb.size();
+        clci.pBindings = cb.data();
+        vkCheck(vkCreateDescriptorSetLayout(dev, &clci, nullptr, &compDescLayout), "compute descriptor layout");
+
         std::array<VkDescriptorPoolSize, 4> sizes{ {
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 },   // RT(4) + 2 compute sets(4 each)
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
         } };
         VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pci.maxSets = 1;
+        pci.maxSets = 3;   // 1 RT set + 2 compute sets
         pci.poolSizeCount = (uint32_t)sizes.size();
         pci.pPoolSizes = sizes.data();
         vkCheck(vkCreateDescriptorPool(dev, &pci, nullptr, &descPool), "descriptor pool");
@@ -1188,8 +1255,12 @@ private:
         asWrite.pAccelerationStructures = &tlas;
 
         VkDescriptorImageInfo imgInfo{};
-        imgInfo.imageView = storageView;
+        imgInfo.imageView = denView[0];   // ray-gen writes linear HDR here for the denoiser
         imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo guideInfo{};
+        guideInfo.imageView = guideView;
+        guideInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo histInfo0{};
         histInfo0.imageView = histView[0];
@@ -1202,7 +1273,7 @@ private:
         VkDescriptorBufferInfo vInfo{ vertexBuffer.buf, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo iInfo{ indexBuffer.buf, 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 7> writes{};
+        std::array<VkWriteDescriptorSet, 8> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[0].pNext = &asWrite;
         writes[0].dstSet = descSet; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
@@ -1232,7 +1303,45 @@ private:
         writes[6].dstSet = descSet; writes[6].dstBinding = 6; writes[6].descriptorCount = 1;
         writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[6].pImageInfo = &histInfo1;
 
+        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        writes[7].dstSet = descSet; writes[7].dstBinding = 7; writes[7].descriptorCount = 1;
+        writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[7].pImageInfo = &guideInfo;
+
         vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+
+        // ---- Compute (denoiser) descriptor sets: two for ping-pong ----
+        VkDescriptorSetLayout cl[2] = { compDescLayout, compDescLayout };
+        VkDescriptorSetAllocateInfo cai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        cai.descriptorPool = descPool;
+        cai.descriptorSetCount = 2;
+        cai.pSetLayouts = cl;
+        vkCheck(vkAllocateDescriptorSets(dev, &cai, compSet), "alloc compute sets");
+
+        VkDescriptorImageInfo den0{ VK_NULL_HANDLE, denView[0], VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo den1{ VK_NULL_HANDLE, denView[1], VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo gInf{ VK_NULL_HANDLE, guideView,  VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo ldr { VK_NULL_HANDLE, storageView, VK_IMAGE_LAYOUT_GENERAL };
+        // set 0: in = den0, out = den1 ; set 1: in = den1, out = den0
+        VkDescriptorImageInfo* inInfo[2]  = { &den0, &den1 };
+        VkDescriptorImageInfo* outInfo[2] = { &den1, &den0 };
+
+        std::array<VkWriteDescriptorSet, 8> cw{};
+        for (int s = 0; s < 2; ++s) {
+            int b = s * 4;
+            cw[b + 0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw[b + 0].dstSet = compSet[s]; cw[b + 0].dstBinding = 0; cw[b + 0].descriptorCount = 1;
+            cw[b + 0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 0].pImageInfo = inInfo[s];
+            cw[b + 1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw[b + 1].dstSet = compSet[s]; cw[b + 1].dstBinding = 1; cw[b + 1].descriptorCount = 1;
+            cw[b + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 1].pImageInfo = outInfo[s];
+            cw[b + 2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw[b + 2].dstSet = compSet[s]; cw[b + 2].dstBinding = 2; cw[b + 2].descriptorCount = 1;
+            cw[b + 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 2].pImageInfo = &gInf;
+            cw[b + 3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw[b + 3].dstSet = compSet[s]; cw[b + 3].dstBinding = 3; cw[b + 3].descriptorCount = 1;
+            cw[b + 3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 3].pImageInfo = &ldr;
+        }
+        vkUpdateDescriptorSets(dev, (uint32_t)cw.size(), cw.data(), 0, nullptr);
     }
 
     // -------------------------------------------------------------------------
@@ -1309,6 +1418,39 @@ private:
         vkDestroyShaderModule(dev, miss, nullptr);
         vkDestroyShaderModule(dev, smiss, nullptr);
         vkDestroyShaderModule(dev, chit, nullptr);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Denoiser compute pipeline (a-trous wavelet filter + tone-map)
+    // -------------------------------------------------------------------------
+    struct AtrousPC { int32_t sizeX, sizeY, step, finalPass; float exposure; };
+
+    void createComputePipeline() {
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.offset = 0;
+        pcr.size = sizeof(AtrousPC);
+
+        VkPipelineLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        lci.setLayoutCount = 1;
+        lci.pSetLayouts = &compDescLayout;
+        lci.pushConstantRangeCount = 1;
+        lci.pPushConstantRanges = &pcr;
+        vkCheck(vkCreatePipelineLayout(dev, &lci, nullptr, &compPipelineLayout), "compute pipeline layout");
+
+        VkShaderModule cs = loadShader("shaders/atrous.comp.spv");
+        VkPipelineShaderStageCreateInfo st{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+        st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        st.module = cs;
+        st.pName = "main";
+
+        VkComputePipelineCreateInfo cci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        cci.stage = st;
+        cci.layout = compPipelineLayout;
+        vkCheck(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cci, nullptr, &compPipeline),
+            "create compute pipeline");
+
+        vkDestroyShaderModule(dev, cs, nullptr);
     }
 
     // -------------------------------------------------------------------------
@@ -1443,11 +1585,11 @@ private:
         VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmd, &bi);
 
-        // Storage image -> GENERAL for ray tracing writes.
+        // Output (rgba8) -> GENERAL; the denoiser's final compute pass writes it.
         imageBarrier(cmd, storageImage,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
             0, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
         // Make the previous frame's history writes visible to this frame's reads.
         for (int i = 0; i < 2; ++i)
@@ -1463,11 +1605,52 @@ private:
         pvkCmdTraceRays(cmd, &rgenRegion, &missRegion, &hitRegion, &callRegion,
             swapExtent.width, swapExtent.height, 1);
 
-        // Storage image -> TRANSFER_SRC, swapchain image -> TRANSFER_DST.
+        // ---- Denoiser: a-trous compute passes on the ray-traced result ----
+        // RT outputs (colour den[0], guide) must be visible to compute reads.
+        imageBarrier(cmd, denImg[0],
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        imageBarrier(cmd, guideImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compPipeline);
+        uint32_t gx = (swapExtent.width + 7) / 8, gy = (swapExtent.height + 7) / 8;
+        float exposure = 1.1f;
+        int passes = atrousPasses;
+
+        if (passes <= 0) {
+            // Denoiser off: a single pass with step 0 = pure tone-map copy.
+            AtrousPC pc{ (int)swapExtent.width, (int)swapExtent.height, 0, 1, exposure };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                compPipelineLayout, 0, 1, &compSet[0], 0, nullptr);
+            vkCmdPushConstants(cmd, compPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(cmd, gx, gy, 1);
+        } else {
+            for (int i = 0; i < passes; ++i) {
+                int setIdx = i & 1;                 // set0 reads den0, set1 reads den1
+                int outIdx = 1 - setIdx;            // image this pass writes
+                AtrousPC pc{ (int)swapExtent.width, (int)swapExtent.height,
+                             1 << i, (i == passes - 1) ? 1 : 0, exposure };
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    compPipelineLayout, 0, 1, &compSet[setIdx], 0, nullptr);
+                vkCmdPushConstants(cmd, compPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(cmd, gx, gy, 1);
+                if (i < passes - 1)                 // make this output readable next pass
+                    imageBarrier(cmd, denImg[outIdx],
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            }
+        }
+
+        // Final compute pass wrote storageImage -> TRANSFER_SRC; swapchain -> TRANSFER_DST.
         imageBarrier(cmd, storageImage,
             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         imageBarrier(cmd, swapImages[imageIndex],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1537,6 +1720,9 @@ private:
 
     void cleanup() {
         destroyBuffer(sbtBuffer);
+        if (compPipeline)       vkDestroyPipeline(dev, compPipeline, nullptr);
+        if (compPipelineLayout) vkDestroyPipelineLayout(dev, compPipelineLayout, nullptr);
+        if (compDescLayout)     vkDestroyDescriptorSetLayout(dev, compDescLayout, nullptr);
         if (rtPipeline)     vkDestroyPipeline(dev, rtPipeline, nullptr);
         if (pipelineLayout) vkDestroyPipelineLayout(dev, pipelineLayout, nullptr);
         if (descPool)       vkDestroyDescriptorPool(dev, descPool, nullptr);
@@ -1551,6 +1737,14 @@ private:
             if (histImg[i])  vkDestroyImage(dev, histImg[i], nullptr);
             if (histMem[i])  vkFreeMemory(dev, histMem[i], nullptr);
         }
+        for (int i = 0; i < 2; ++i) {
+            if (denView[i]) vkDestroyImageView(dev, denView[i], nullptr);
+            if (denImg[i])  vkDestroyImage(dev, denImg[i], nullptr);
+            if (denMem[i])  vkFreeMemory(dev, denMem[i], nullptr);
+        }
+        if (guideView) vkDestroyImageView(dev, guideView, nullptr);
+        if (guideImg)  vkDestroyImage(dev, guideImg, nullptr);
+        if (guideMem)  vkFreeMemory(dev, guideMem, nullptr);
 
         if (tlas) pvkDestroyAccelerationStructure(dev, tlas, nullptr);
         if (blas) pvkDestroyAccelerationStructure(dev, blas, nullptr);

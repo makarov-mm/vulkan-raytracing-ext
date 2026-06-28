@@ -13,7 +13,7 @@ if not exist %GLSLANG% (
 
 echo Compiling shaders with %GLSLANG%
 
-for %%S in (raygen.rgen miss.rmiss shadow.rmiss closesthit.rchit) do (
+for %%S in (raygen.rgen miss.rmiss shadow.rmiss closesthit.rchit atrous.comp) do (
     %GLSLANG% --target-env vulkan1.2 -V "%%S" -o "%%S.spv"
     if errorlevel 1 (
         echo ERROR compiling %%S

@@ -1,0 +1,70 @@
+#version 460
+
+// Edge-avoiding a-trous wavelet filter (SVGF-style spatial denoise).
+// Runs several times with a growing step; the last pass also tone-maps.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly  image2D colorIn;
+layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D colorOut;
+layout(set = 0, binding = 2, rgba32f) uniform readonly  image2D guide;   // xyz = normal, w = depth
+layout(set = 0, binding = 3, rgba8)   uniform writeonly image2D outLDR;
+
+layout(push_constant) uniform PC {
+    ivec2 size;
+    int   step;
+    int   finalPass;
+    float exposure;
+} pc;
+
+vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec4 gC = imageLoad(guide, p);
+    vec3 nC = gC.xyz;
+    float zC = gC.w;
+    vec3 cC = imageLoad(colorIn, p).rgb;
+
+    // Background (sky / miss): nothing to denoise, just carry through.
+    if (zC <= 0.0) {
+        imageStore(colorOut, p, vec4(cC, 0.0));
+        if (pc.finalPass != 0) imageStore(outLDR, p, vec4(aces(cC * pc.exposure), 1.0));
+        return;
+    }
+
+    const float kern[5] = float[](1.0, 4.0, 6.0, 4.0, 1.0);
+    const float sigN = 64.0;   // normal sharpness
+    const float sigZ = 4.0;    // depth tolerance
+    const float sigL = 0.50;   // luminance tolerance (keeps lit/shadow edges)
+    float lumC = luma(cC);
+
+    vec3  sum  = vec3(0.0);
+    float wsum = 0.0;
+    for (int dy = -2; dy <= 2; ++dy)
+    for (int dx = -2; dx <= 2; ++dx) {
+        ivec2 q = p + ivec2(dx, dy) * pc.step;
+        if (q.x < 0 || q.y < 0 || q.x >= pc.size.x || q.y >= pc.size.y) continue;
+        vec4 gQ = imageLoad(guide, q);
+        if (gQ.w <= 0.0) continue;                 // skip background neighbours
+        vec3 cQ = imageLoad(colorIn, q).rgb;
+
+        float wN = pow(max(dot(nC, gQ.xyz), 0.0), sigN);
+        float wZ = exp(-abs(zC - gQ.w) / (sigZ * float(pc.step) + 1e-3));
+        float wL = exp(-abs(lumC - luma(cQ)) / (sigL + 1e-3));
+        float h  = kern[dx + 2] * kern[dy + 2] * (1.0 / 256.0);
+        float w  = h * wN * wZ * wL;
+        sum  += cQ * w;
+        wsum += w;
+    }
+
+    vec3 o = (wsum > 0.0) ? sum / wsum : cC;
+    imageStore(colorOut, p, vec4(o, zC));
+    if (pc.finalPass != 0) imageStore(outLDR, p, vec4(aces(o * pc.exposure), 1.0));
+}
