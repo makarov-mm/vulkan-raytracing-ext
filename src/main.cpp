@@ -1390,15 +1390,15 @@ private:
         data.lightPos[3] = 1.2f;
         Vec3 pc = haveHistory ? prevCamPos : eye;
         data.prevCamPos[0] = pc.x; data.prevCamPos[1] = pc.y; data.prevCamPos[2] = pc.z;
-        data.prevCamPos[3] = 0.10f;   // TAA blend alpha (lower = smoother, more lag)
+        data.prevCamPos[3] = 0.085f;  // TAA blend alpha (lower = smoother, more lag)
         data.params[0] = t;
         data.params[1] = 8.0f;        // max bounces (glass needs a few)
         data.params[2] = 1.4f;        // light intensity
-        data.params[3] = 6.0f;        // samples/frame (multiple of 3 for even dispersion)
+        data.params[3] = 9.0f;        // samples/frame (multiple of 3 for even dispersion)
         data.frame[1]  = totalFrame;
         data.frame[2]  = haveHistory ? 1u : 0u;   // historyValid
         data.frame[3]  = totalFrame & 1u;         // ping-pong parity
-        data.lens[0]   = 0.05f;                    // aperture radius (0 = pinhole, larger = more blur)
+        data.lens[0]   = 0.0f;                     // aperture radius (0 = pinhole/sharp; >0 = DoF, noisy without a denoiser)
         data.lens[1]   = std::sqrt(dot(eye - center, eye - center)); // focus distance (centre sharp)
         data.lens[2]   = 1.1f;                      // exposure (pre tone-map)
         uploadToBuffer(ubo, &data, sizeof(data));

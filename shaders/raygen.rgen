@@ -192,17 +192,20 @@ void main() {
     int  spp    = max(1, int(cam.params.w));
     uint parity = cam.frame.w;
 
-    vec3 color = vec3(0.0);
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0);   // sum and sum-of-squares for variance clipping
     vec3 wp = vec3(0.0), prevHit = vec3(0.0);
     bool valid = false;
     for (int s = 0; s < spp; ++s) {
         uint seed = (gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u
                    + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
         vec3 hp, php; bool hv;
-        color += renderSample(seed, s, hp, php, hv);
+        vec3 c = renderSample(seed, s, hp, php, hv);
+        m1 += c; m2 += c * c;
         if (s == 0) { wp = hp; prevHit = php; valid = hv; }
     }
-    color /= float(spp);
+    vec3 mean  = m1 / float(spp);
+    vec3 sigma = sqrt(max(m2 / float(spp) - mean * mean, vec3(0.0)));
+    vec3 color = mean;
 
     ivec2 pix    = ivec2(gl_LaunchIDEXT.xy);
     vec3  camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
@@ -210,6 +213,10 @@ void main() {
     float curKey = valid ? length(camPos - wp) : 1e9;
 
     // ---- Temporal reprojection with per-object motion vectors -------------
+    // The motion vector belongs to the primary surface, so reflections and
+    // shadows that move across a static surface would otherwise ghost. Variance
+    // clipping clamps the history into the range the current samples actually
+    // span, so changing reflections snap to the new value instead of smearing.
     vec3 resolved = color;
     if (cam.frame.z != 0u && valid) {
         vec4 pc = cam.prevViewProj * vec4(prevHit, 1.0);  // where this surface was last frame
@@ -220,7 +227,10 @@ void main() {
                 vec4 hist = (parity == 0u) ? imageLoad(histA, hpix) : imageLoad(histB, hpix);
                 float expected = length(cam.prevCamPos.xyz - prevHit);
                 if (abs(hist.a - expected) < 0.04 * max(expected, 1.0)) {
-                    resolved = mix(hist.rgb, color, alpha);
+                    vec3 lo = mean - 2.5 * sigma - 0.02;
+                    vec3 hi = mean + 2.5 * sigma + 0.02;
+                    vec3 clamped = clamp(hist.rgb, lo, hi);
+                    resolved = mix(clamped, color, alpha);
                 }
             }
         }
@@ -230,7 +240,7 @@ void main() {
     if (parity == 0u) imageStore(histB, pix, outHist);
     else              imageStore(histA, pix, outHist);
 
-    vec3 mapped = aces(resolved * cam.lens.z);   // exposure, then filmic roll-off
-    vec3 outc   = pow(mapped, vec3(1.0 / 2.2));
+    // ACES already maps into display space, so no extra gamma here.
+    vec3 outc = aces(resolved * cam.lens.z);
     imageStore(outImage, pix, vec4(outc, 1.0));
 }
