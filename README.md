@@ -9,7 +9,7 @@ software tracer.
 Zero external dependencies beyond the Vulkan SDK itself: the window is created
 with raw Win32 (no GLFW) and all math is inline (no GLM).
 
-![preview](preview1.png)
+![preview](preview2.png)
 
 ## Features
 
