@@ -130,6 +130,12 @@ vec3 renderSample(inout uint seed, int sampleIdx,
 
         color += throughput * payload.emission;   // emissive surfaces glow
 
+        // ---- Light source: the visible bulb glows at full intensity --------
+        if (mat == 3) {
+            color += throughput * payload.albedo * 6.0;   // bright HDR; ACES gives a hot core
+            break;
+        }
+
         // ---- Iridescent metal: angle-dependent rainbow reflection ----------
         if (mat == 4) {
             float c = clamp(dot(-dir, N), 0.0, 1.0);
