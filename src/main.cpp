@@ -30,8 +30,8 @@
 // -----------------------------------------------------------------------------
 //  Small helpers
 // -----------------------------------------------------------------------------
-static const uint32_t WIDTH  = 1920;
-static const uint32_t HEIGHT = 1080;
+static const uint32_t WIDTH  = 800;
+static const uint32_t HEIGHT = 800;
 
 #ifdef NDEBUG
 static const bool kEnableValidation = false;
@@ -196,7 +196,7 @@ private:
     // ---- Interactive orbit camera ----
     float camYaw      = 2.2f;
     float camPitch    = 0.42f;
-    float camDist     = 9.0f;
+    float camDist     = 15.0f;
     bool  dragging    = false;
     POINT lastMouse{};
     bool  cameraDirty = true;   // forces an accumulation reset
@@ -782,6 +782,79 @@ private:
         }
     }
 
+    // Flat-shaded triangle with an outward normal (oriented away from an interior point).
+    void flatTri(Vec3 a, Vec3 b, Vec3 c, Vec3 interior, Vec3 col, float mat) {
+        Vec3 nn = normalize(cross(b - a, c - a));
+        Vec3 cen = (a + b + c) * (1.0f / 3.0f);
+        if (dot(nn, cen - interior) < 0.0f) nn = nn * -1.0f;
+        uint32_t t = (uint32_t)sceneVerts.size();
+        pushVert(a, nn, col, 0.0f, mat); pushVert(b, nn, col, 0.0f, mat); pushVert(c, nn, col, 0.0f, mat);
+        sceneIndices.push_back(t); sceneIndices.push_back(t + 1); sceneIndices.push_back(t + 2);
+    }
+
+    // Square-based pyramid (base on the floor at center.y, apex above).
+    void addPyramid(Vec3 center, float s, float h, Vec3 col, float mat) {
+        float hs = s * 0.5f;
+        Vec3 interior = center + Vec3{ 0, h * 0.30f, 0 };
+        Vec3 b0 = center + Vec3{ -hs,0,-hs }, b1 = center + Vec3{ hs,0,-hs };
+        Vec3 b2 = center + Vec3{ hs,0,hs }, b3 = center + Vec3{ -hs,0,hs };
+        Vec3 ap = center + Vec3{ 0,h,0 };
+        flatTri(b0, b1, ap, interior, col, mat);
+        flatTri(b1, b2, ap, interior, col, mat);
+        flatTri(b2, b3, ap, interior, col, mat);
+        flatTri(b3, b0, ap, interior, col, mat);
+        flatTri(b0, b2, b1, interior, col, mat);   // base
+        flatTri(b0, b3, b2, interior, col, mat);
+    }
+
+    // Cylinder with smooth (curved-normal) sides and flat caps. center.y = base.
+    void addCylinder(Vec3 center, float r, float h, Vec3 col, float mat, int N = 48) {
+        const float PI = 3.14159265358979f;
+        Vec3 top = center + Vec3{ 0,h,0 };
+        for (int i = 0; i < N; ++i) {
+            float a0 = 2 * PI * i / N, a1 = 2 * PI * (i + 1) / N;
+            Vec3 d0{ std::cos(a0),0,std::sin(a0) }, d1{ std::cos(a1),0,std::sin(a1) };
+            Vec3 bl = center + d0 * r, br = center + d1 * r;
+            Vec3 tl = top + d0 * r, tr = top + d1 * r;
+            uint32_t b = (uint32_t)sceneVerts.size();
+            pushVert(bl, d0, col, 0.0f, mat); pushVert(br, d1, col, 0.0f, mat);
+            pushVert(tr, d1, col, 0.0f, mat); pushVert(tl, d0, col, 0.0f, mat);
+            sceneIndices.push_back(b); sceneIndices.push_back(b + 1); sceneIndices.push_back(b + 2);
+            sceneIndices.push_back(b); sceneIndices.push_back(b + 2); sceneIndices.push_back(b + 3);
+            // caps (flat)
+            uint32_t cb = (uint32_t)sceneVerts.size();
+            pushVert(center, { 0,-1,0 }, col, 0.0f, mat); pushVert(center + d1 * r, { 0,-1,0 }, col, 0.0f, mat); pushVert(center + d0 * r, { 0,-1,0 }, col, 0.0f, mat);
+            sceneIndices.push_back(cb); sceneIndices.push_back(cb + 1); sceneIndices.push_back(cb + 2);
+            uint32_t ct = (uint32_t)sceneVerts.size();
+            pushVert(top, { 0,1,0 }, col, 0.0f, mat); pushVert(top + d0 * r, { 0,1,0 }, col, 0.0f, mat); pushVert(top + d1 * r, { 0,1,0 }, col, 0.0f, mat);
+            sceneIndices.push_back(ct); sceneIndices.push_back(ct + 1); sceneIndices.push_back(ct + 2);
+        }
+    }
+
+    // Regular dodecahedron (12 flat pentagonal faces). center.y - s is the lowest point; s = circumradius.
+    void addDodecahedron(Vec3 center, float s, Vec3 col, float mat) {
+        const float P = 1.6180339887f, a = 1.0f / P;
+        const Vec3 DV[20] = {
+            {-1,-1,-1},{-1,-1,1},{-1,1,-1},{-1,1,1},{1,-1,-1},{1,-1,1},{1,1,-1},{1,1,1},
+            {0,-a,-P},{0,-a,P},{0,a,-P},{0,a,P},
+            {-a,-P,0},{-a,P,0},{a,-P,0},{a,P,0},
+            {-P,0,-a},{-P,0,a},{P,0,-a},{P,0,a}
+        };
+        static const int FACES[12][5] = {
+            {14,12,0,8,4},{10,8,0,16,2},{17,16,0,12,1},{5,9,1,12,14},
+            {3,17,1,9,11},{6,10,2,13,15},{3,13,2,16,17},{15,13,3,11,7},
+            {6,18,4,8,10},{5,14,4,18,19},{11,9,5,19,7},{19,18,6,15,7}
+        };
+        float scale = s / 1.7320508f;   // circumradius of DV is sqrt(3)
+        for (int f = 0; f < 12; ++f) {
+            Vec3 v[5];
+            for (int k = 0; k < 5; ++k) v[k] = center + DV[FACES[f][k]] * scale;
+            flatTri(v[0], v[1], v[2], center, col, mat);   // fan
+            flatTri(v[0], v[2], v[3], center, col, mat);
+            flatTri(v[0], v[3], v[4], center, col, mat);
+        }
+    }
+
     // ---- Morphing grid shapes (regenerated each frame) ----
     struct SuperParams { float m1, n1, n2, n3, m2, q1, q2, q3; };
     struct Morpher {
@@ -897,18 +970,23 @@ private:
         const int U = 120, Vr = 60;
         addFloor(20.0f, 0.4f);
 
-        // Morphing supertoroid -- clear glass, tumbling so the twist reads.
+        // Centre: morphing supertoroid -- clear glass, tumbling so the twist reads.
         { uint32_t off = genGrid(U, Vr, { 1.0f, 1.0f, 1.0f }, 2.0f);
           morphers.push_back({ 1, off, U, Vr, { 0.0f, 2.7f, 0.0f }, { 1.0f, 0.25f, 0.35f }, 0.5f }); }
 
-        // Morphing supershape -- neutral cool glass, slow spin.
-        { uint32_t off = genGrid(U, Vr, { 0.85f, 0.90f, 0.97f }, 2.0f);
-          morphers.push_back({ 2, off, U, Vr, { -5.6f, 2.4f, -1.0f }, { 0.0f, 1.0f, 0.2f }, 0.55f }); }
-
-        // Static glass pieces.
-        addSphere({ 5.6f, 1.4f, -0.3f }, 1.4f, { 1.0f, 1.0f, 1.0f }, 0.0f, 2.0f);   // clear glass sphere
-        addDiamond({ 2.8f, 1.5f, 3.2f }, 1.3f, { 1.0f, 1.0f, 1.0f }, 2.0f, 16);      // clear faceted gem
-        addCube({ -3.2f, 1.0f, 3.0f }, 2.0f, { 0.80f, 0.95f, 0.88f }, 2.0f);         // soft green glass cube
+        // Six coloured glass shapes evenly spaced around the centre.
+        const float ring = 6.2f, PI = 3.14159265358979f;
+        auto ringPos = [&](int k) {
+            float ang = (float)k / 6.0f * 2.0f * PI;
+            return Vec3{ std::cos(ang) * ring, 0.0f, std::sin(ang) * ring };
+        };
+        Vec3 p;
+        p = ringPos(0); addSphere({ p.x, 1.3f, p.z }, 1.3f, { 0.55f, 0.72f, 1.00f }, 0.0f, 2.0f);          // blue sphere
+        p = ringPos(1); addDiamond({ p.x, 1.5f, p.z }, 1.25f, { 1.00f, 0.65f, 0.72f }, 2.0f, 16);          // pink diamond
+        p = ringPos(2); addCube({ p.x, 1.0f, p.z }, 2.0f, { 0.55f, 0.95f, 0.65f }, 2.0f);                  // green cube
+        p = ringPos(3); addPyramid({ p.x, 0.0f, p.z }, 2.2f, 2.4f, { 1.00f, 0.85f, 0.45f }, 2.0f);         // amber pyramid
+        p = ringPos(4); addCylinder({ p.x, 0.0f, p.z }, 1.05f, 2.4f, { 0.45f, 0.92f, 0.92f }, 2.0f, 56);   // cyan cylinder
+        p = ringPos(5); addDodecahedron({ p.x, 1.55f, p.z }, 1.55f, { 0.78f, 0.60f, 1.00f }, 2.0f);        // purple dodecahedron
 
         // Visible area light (emissive). Radius must match lightPos[3] in updateUniforms.
         addSphere({ 4.0f, 7.0f, -2.0f }, 1.2f, { 1.0f, 0.95f, 0.85f }, 0.0f, 3.0f);
