@@ -5,8 +5,6 @@ struct HitPayload {
     vec3  hitPos;
     vec3  normal;
     vec3  albedo;
-    vec3  prevHitPos;
-    vec3  emission;
     float reflectivity;
     float matId;
     float t;

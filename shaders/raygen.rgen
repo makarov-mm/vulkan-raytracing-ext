@@ -2,37 +2,36 @@
 #extension GL_EXT_ray_tracing : require
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 1, set = 0, rgba32f) uniform image2D outImage;   // linear HDR for the denoiser
+layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
 layout(binding = 2, set = 0) uniform CameraProperties {
     mat4 viewInverse;
     mat4 projInverse;
-    mat4 prevViewProj;
-    vec4 lightPos;         // xyz = position, w = radius
-    vec4 prevCamPos;       // xyz = previous camera position, w = TAA blend alpha
-    vec4 params;           // x = time, y = maxBounces, z = intensity, w = samples/frame
-    uvec4 frame;           // y = free-running frame, z = historyValid, w = parity
-    vec4  lens;            // x = aperture radius, y = focus distance, z = exposure
+    vec4 lightPos;   // xyz = position, w = radius (area light)
+    vec4 params;     // x = time, y = maxBounces, z = light intensity, w = samples per frame
+    uvec4 frame;     // x = accumulated frame index (0 on camera move)
 } cam;
-layout(binding = 5, set = 0, rgba32f) uniform image2D histA;
-layout(binding = 6, set = 0, rgba32f) uniform image2D histB;
-layout(binding = 7, set = 0, rgba32f) uniform image2D guideImage; // xyz normal, w depth
+layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
+layout(binding = 6, set = 0, rgba32f) uniform image2D histImage; // xyz = prev primary-hit world pos
 
 struct HitPayload {
     vec3  hitPos;
-    vec3  normal;
+    vec3  normal;       // faces against the incoming ray
     vec3  albedo;
-    vec3  prevHitPos;
-    vec3  emission;
     float reflectivity;
-    float matId;          // 0 floor, 1 solid, 2 glass, 3 emissive light, 4 iridescent
-    float t;
-    float frontFace;
+    float matId;        // 0 = floor, 1 = solid, 2 = glass, 3 = emissive light
+    float t;            // < 0 means miss
+    float frontFace;    // 1 = ray hit the outer surface, 0 = inside
 };
+
 layout(location = 0) rayPayloadEXT HitPayload payload;
 layout(location = 1) rayPayloadEXT float      shadowed;
 
+// Per-channel IOR for chromatic dispersion (exaggerated for visibility).
 const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
 
+// ---------------------------------------------------------------------------
+//  PCG random number generator
+// ---------------------------------------------------------------------------
 uint pcg(inout uint state) {
     state = state * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
@@ -40,27 +39,23 @@ uint pcg(inout uint state) {
 }
 float rnd(inout uint state) { return float(pcg(state)) * (1.0 / 4294967296.0); }
 
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
 vec3 skyColor(vec3 d) {
     float h = 0.5 * (normalize(d).y + 1.0);
     return mix(vec3(0.90, 0.95, 1.00), vec3(0.25, 0.45, 0.85), h);
 }
-vec2 concentricDisk(float u1, float u2) {
-    float a = 2.0 * u1 - 1.0, b = 2.0 * u2 - 1.0;
-    if (a == 0.0 && b == 0.0) return vec2(0.0);
-    float r, phi;
-    if (abs(a) > abs(b)) { r = a; phi = 0.78539816 * (b / a); }
-    else                 { r = b; phi = 1.57079633 - 0.78539816 * (a / b); }
-    return r * vec2(cos(phi), sin(phi));
-}
-vec3 aces(vec3 x) {   // Narkowicz ACES filmic approximation
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+vec3 checker(vec3 p) {
+    float s = floor(p.x) + floor(p.z);
+    return mix(vec3(0.85), vec3(0.10), mod(s, 2.0));
 }
 void basis(vec3 n, out vec3 t, out vec3 b) {
     vec3 a = abs(n.x) > 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
     t = normalize(cross(n, a));
     b = cross(n, t);
 }
+// Random direction inside a cone of half-angle acos(cosThetaMax) around dir.
 vec3 sampleCone(vec3 dir, float cosThetaMax, inout uint seed) {
     float u1 = rnd(seed), u2 = rnd(seed);
     float cosT = mix(1.0, cosThetaMax, u1);
@@ -77,10 +72,10 @@ float traceShadow(vec3 origin, vec3 L, float tmax) {
     return shadowed;
 }
 
-vec3 renderSample(inout uint seed, int sampleIdx,
-                  out vec3 firstHit, out vec3 firstPrev, out vec3 firstNormal, out bool firstValid) {
-    firstHit = vec3(0.0); firstPrev = vec3(0.0); firstNormal = vec3(0.0); firstValid = false;
-
+// ---------------------------------------------------------------------------
+//  Trace one full path for one (jittered) sample.
+// ---------------------------------------------------------------------------
+vec3 renderSample(inout uint seed, int sampleIdx) {
     vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
     vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
     vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
@@ -90,87 +85,68 @@ vec3 renderSample(inout uint seed, int sampleIdx,
     vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
     vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
 
-    // Thin-lens depth of field: the focus plane stays sharp, the rest goes to bokeh.
-    float aperture = cam.lens.x;
-    if (aperture > 0.0) {
-        vec3 focusPt = origin + dir * cam.lens.y;
-        vec2 ld = aperture * concentricDisk(rnd(seed), rnd(seed));
-        vec3 right = (cam.viewInverse * vec4(1, 0, 0, 0)).xyz;
-        vec3 up    = (cam.viewInverse * vec4(0, 1, 0, 0)).xyz;
-        origin = origin + right * ld.x + up * ld.y;
-        dir    = normalize(focusPt - origin);
-    }
-
     int   maxBounces = int(cam.params.y);
     float intensity  = cam.params.z;
     const float eps  = 0.001;
 
     vec3 color      = vec3(0.0);
     vec3 throughput = vec3(1.0);
-    int  hero       = sampleIdx % 3;
-    bool dispersed  = false;
+
+    // Spectral channel is fixed per sample (stratified), so over a frame each
+    // R/G/B channel gets an equal share -> dispersion with no channel noise.
+    int  hero      = sampleIdx % 3;     // 0 = R, 1 = G, 2 = B
+    bool dispersed = false;
 
     for (int bounce = 0; bounce <= maxBounces; ++bounce) {
         payload.t = 0.0;
         traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0,
                     origin, 0.001, dir, 10000.0, 0);
 
-        if (bounce == 0) {
-            firstValid = (payload.t >= 0.0);
-            if (firstValid) {
-                firstHit = payload.hitPos; firstPrev = payload.prevHitPos;
-                firstNormal = normalize(payload.normal);
-            }
-        }
-
         if (payload.t < 0.0) { color += throughput * skyColor(dir); break; }
 
         vec3 N   = normalize(payload.normal);
         int  mat = int(payload.matId + 0.5);
 
-        color += throughput * payload.emission;   // emissive surfaces glow
-
-        // ---- Light source: the visible bulb glows at full intensity --------
+        // ---- Emissive area light: see the source directly ------------------
         if (mat == 3) {
-            color += throughput * payload.albedo * 6.0;   // bright HDR; ACES gives a hot core
+            color += throughput * payload.albedo * 3.0;
             break;
-        }
-
-        // ---- Iridescent metal: angle-dependent rainbow reflection ----------
-        if (mat == 4) {
-            float c = clamp(dot(-dir, N), 0.0, 1.0);
-            vec3 tint = 0.55 + 0.45 * cos(6.28318530718 * (vec3(0.0, 0.33, 0.67) + (1.0 - c) * 1.6));
-            color += throughput * tint * 0.18;
-            throughput *= tint * 0.82;
-            dir = reflect(dir, N); origin = payload.hitPos + N * eps;
-            continue;
         }
 
         // ---- Glass: dispersive Fresnel reflect / refract ------------------
         if (mat == 2) {
             float ior = (hero == 0) ? IOR_R : (hero == 1) ? IOR_G : IOR_B;
             float eta = (payload.frontFace > 0.5) ? (1.0 / ior) : ior;
+
             float cosI = clamp(dot(-dir, N), 0.0, 1.0);
             float R0   = (1.0 - 1.52) / (1.0 + 1.52); R0 *= R0;
             float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
-            vec3 refr  = refract(dir, N, eta);
-            bool tir   = dot(refr, refr) < 1e-6;
+
+            vec3 refr = refract(dir, N, eta);
+            bool tir  = dot(refr, refr) < 1e-6;
+
             if (tir || rnd(seed) < fres) {
-                dir = reflect(dir, N); origin = payload.hitPos + N * eps;
+                dir    = reflect(dir, N);
+                origin = payload.hitPos + N * eps;          // reflection stays full-colour
             } else {
-                dir = normalize(refr); origin = payload.hitPos - N * eps;
-                if (!dispersed) {
-                    vec3 m = (hero == 0) ? vec3(1,0,0) : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
-                    throughput *= 3.0 * m; dispersed = true;
+                dir    = normalize(refr);
+                origin = payload.hitPos - N * eps;
+                if (!dispersed) {                            // collapse to the hero channel
+                    vec3 mask = (hero == 0) ? vec3(1,0,0)
+                              : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
+                    throughput *= 3.0 * mask;
+                    dispersed = true;
                 }
+                throughput *= mix(vec3(1.0), payload.albedo, 0.35); // coloured glass
             }
-            throughput *= vec3(0.98);
+            throughput *= vec3(0.98); // very light absorption
             continue;
         }
 
         // ---- Floor / solid object -----------------------------------------
-        vec3 albedo = payload.albedo;
+        vec3 albedo = (mat == 0) ? checker(payload.hitPos) : payload.albedo;
 
+        // Area light: cone subtended by the light sphere -> distance-dependent penumbra.
         vec3  toLight = cam.lightPos.xyz - payload.hitPos;
         float dist    = length(toLight);
         vec3  Lc      = toLight / dist;
@@ -178,7 +154,8 @@ vec3 renderSample(inout uint seed, int sampleIdx,
         float cosMax  = sqrt(1.0 - sinMax * sinMax);
         float tmax    = dist - cam.lightPos.w * 1.001;
 
-        const int SHADOW_SAMPLES = 4;
+        // Several shadow rays per hit -> smooth penumbra without leaning on accumulation.
+        const int SHADOW_SAMPLES = 6;
         float diffAcc = 0.0;
         for (int si = 0; si < SHADOW_SAMPLES; ++si) {
             vec3  Ls = sampleCone(Lc, cosMax, seed);
@@ -190,6 +167,7 @@ vec3 renderSample(inout uint seed, int sampleIdx,
 
         float refl = payload.reflectivity;
         color += throughput * local * (1.0 - refl);
+
         if (refl <= 0.001) break;
         throughput *= refl;
         dir    = reflect(dir, N);
@@ -198,60 +176,54 @@ vec3 renderSample(inout uint seed, int sampleIdx,
     return color;
 }
 
+// Non-jittered centre primary ray -> world hit position (sky returns a stable far point).
+// Used only for the per-pixel motion test, so anti-alias jitter must NOT be applied here.
+vec3 primaryHitPos() {
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+    payload.t = 0.0;
+    traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, origin, 0.001, dir, 10000.0, 0);
+    if (payload.t < 0.0) return origin + dir * 1000.0; // sky: stable while the camera is still
+    return payload.hitPos;
+}
+
 void main() {
-    int  spp    = max(1, int(cam.params.w));
-    uint parity = cam.frame.w;
+    int spp = max(1, int(cam.params.w));
 
-    vec3 m1 = vec3(0.0), m2 = vec3(0.0);   // sum and sum-of-squares for variance clipping
-    vec3 wp = vec3(0.0), prevHit = vec3(0.0), firstN = vec3(0.0);
-    bool valid = false;
+    vec3 color = vec3(0.0);
     for (int s = 0; s < spp; ++s) {
-        uint seed = (gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u
+        // Seed from the free-running frame counter (frame.y), not the accumulation
+        // counter (frame.x), so the noise still changes frame-to-frame while moving.
+        uint seed = (gl_LaunchIDEXT.x * 1973u
+                   + gl_LaunchIDEXT.y * 9277u
                    + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
-        vec3 hp, php, hn; bool hv;
-        vec3 c = renderSample(seed, s, hp, php, hn, hv);
-        m1 += c; m2 += c * c;
-        if (s == 0) { wp = hp; prevHit = php; firstN = hn; valid = hv; }
+        color += renderSample(seed, s);
     }
-    vec3 mean  = m1 / float(spp);
-    vec3 sigma = sqrt(max(m2 / float(spp) - mean * mean, vec3(0.0)));
-    vec3 color = mean;
+    color /= float(spp);
 
-    ivec2 pix    = ivec2(gl_LaunchIDEXT.xy);
-    vec3  camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
-    float alpha  = cam.prevCamPos.w;
-    float curKey = valid ? length(camPos - wp) : 1e9;
+    // ---- Per-pixel adaptive accumulation ----------------------------------
+    // Static pixels accumulate forever (converge to a clean, sharp image, like the
+    // original static renderer). Pixels where the geometry moved this frame reset,
+    // so the morphing/spinning glass stays sharp instead of smearing.
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    vec3  curPos  = primaryHitPos();
+    vec3  prevPos = imageLoad(histImage, pix).xyz;
+    vec3  eye     = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    float camDist = distance(curPos, eye);
+    float moved   = distance(curPos, prevPos);
+    bool  reset   = (cam.frame.x == 0u) || (moved > 0.0008 * camDist + 0.0012);
 
-    // ---- Temporal reprojection with per-object motion vectors -------------
-    // The motion vector belongs to the primary surface, so reflections and
-    // shadows that move across a static surface would otherwise ghost. Variance
-    // clipping clamps the history into the range the current samples actually
-    // span, so changing reflections snap to the new value instead of smearing.
-    vec3 resolved = color;
-    if (cam.frame.z != 0u && valid) {
-        vec4 pc = cam.prevViewProj * vec4(prevHit, 1.0);  // where this surface was last frame
-        if (pc.w > 0.0) {
-            vec2 uv = (pc.xy / pc.w) * 0.5 + 0.5;
-            if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
-                ivec2 hpix = ivec2(uv * vec2(gl_LaunchSizeEXT.xy));
-                vec4 hist = (parity == 0u) ? imageLoad(histA, hpix) : imageLoad(histB, hpix);
-                float expected = length(cam.prevCamPos.xyz - prevHit);
-                if (abs(hist.a - expected) < 0.04 * max(expected, 1.0)) {
-                    vec3 lo = mean - 2.5 * sigma - 0.02;
-                    vec3 hi = mean + 2.5 * sigma + 0.02;
-                    vec3 clamped = clamp(hist.rgb, lo, hi);
-                    resolved = mix(clamped, color, alpha);
-                }
-            }
-        }
-    }
+    vec4  prevAcc = imageLoad(accumImage, pix);
+    float count   = reset ? 0.0 : prevAcc.a;
+    vec3  accum   = (count < 0.5) ? color : mix(prevAcc.rgb, color, 1.0 / (count + 1.0));
+    count += 1.0;
+    imageStore(accumImage, pix, vec4(accum, count));
+    imageStore(histImage,  pix, vec4(curPos, 0.0));
 
-    vec4 outHist = vec4(resolved, curKey);
-    if (parity == 0u) imageStore(histB, pix, outHist);
-    else              imageStore(histA, pix, outHist);
-
-    // Hand the linear-HDR colour and a normal/depth guide to the denoiser.
-    float depth = valid ? length(camPos - wp) : 0.0;
-    imageStore(outImage,   pix, vec4(resolved, 1.0));
-    imageStore(guideImage, pix, vec4(firstN, depth));
+    vec3 outc = pow(clamp(accum, 0.0, 1.0), vec3(1.0 / 2.2)); // gamma
+    imageStore(outImage, pix, vec4(outc, 1.0));
 }

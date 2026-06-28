@@ -30,8 +30,8 @@
 // -----------------------------------------------------------------------------
 //  Small helpers
 // -----------------------------------------------------------------------------
-static const uint32_t WIDTH  = 800;
-static const uint32_t HEIGHT = 800;
+static const uint32_t WIDTH  = 1920;
+static const uint32_t HEIGHT = 1080;
 
 #ifdef NDEBUG
 static const bool kEnableValidation = false;
@@ -68,18 +68,16 @@ static Vec3 normalize(Vec3 v) {
     float l = std::sqrt(dot(v, v));
     return l > 0 ? Vec3{ v.x / l, v.y / l, v.z / l } : v;
 }
-
-// Small 3x3 (columns) for rotating object vertices/normals each frame.
+// Minimal 3x3 (column vectors) with axis-angle construction, for spinning objects.
 struct Mat3 { Vec3 c0{ 1,0,0 }, c1{ 0,1,0 }, c2{ 0,0,1 }; };
 static Vec3 mul3(const Mat3& m, Vec3 v) { return m.c0 * v.x + m.c1 * v.y + m.c2 * v.z; }
 static Mat3 rotAxis(Vec3 axis, float ang) {
     axis = normalize(axis);
-    float c = std::cos(ang), s = std::sin(ang), t = 1.0f - c;
-    float x = axis.x, y = axis.y, z = axis.z;
+    float c = std::cos(ang), s = std::sin(ang), t = 1 - c, x = axis.x, y = axis.y, z = axis.z;
     Mat3 m;
-    m.c0 = { c + x*x*t,     x*y*t + z*s,  x*z*t - y*s };
-    m.c1 = { x*y*t - z*s,   c + y*y*t,    y*z*t + x*s };
-    m.c2 = { x*z*t + y*s,   y*z*t - x*s,  c + z*z*t   };
+    m.c0 = { c + x * x * t,     x * y * t + z * s, x * z * t - y * s };
+    m.c1 = { x * y * t - z * s, c + y * y * t,     y * z * t + x * s };
+    m.c2 = { x * z * t + y * s, y * z * t - x * s, c + z * z * t };
     return m;
 }
 
@@ -115,17 +113,6 @@ static Mat4 perspectiveVk(float fovY, float aspect, float zNear, float zFar) {
     return r;
 }
 
-static Mat4 mul(const Mat4& a, const Mat4& b) {
-    Mat4 c;
-    for (int col = 0; col < 4; ++col)
-        for (int row = 0; row < 4; ++row) {
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) s += a.m[k * 4 + row] * b.m[col * 4 + k];
-            c.m[col * 4 + row] = s;
-        }
-    return c;
-}
-
 // General 4x4 inverse (adjugate / determinant).
 static Mat4 inverse(const Mat4& in) {
     const float* m = in.m;
@@ -159,22 +146,17 @@ static Mat4 inverse(const Mat4& in) {
 //  Vertex / scene data (matches the GLSL std430 layout)
 // -----------------------------------------------------------------------------
 struct Vertex {
-    float pos[3];  float reflectivity;  // vec4: xyz world position, w reflectivity
-    float nrm[3];  float matId;         // vec4: xyz world normal,   w material id
-    float col[3];  float texId;         // vec4: xyz colour,         w texture id
-    float loc[3];  float bump;          // vec4: xyz object-space pos, w bump strength
-    float prv[3];  float emissive;      // vec4: xyz previous world pos, w emissive strength
+    float pos[3];  float reflectivity;  // vec4: xyz position, w reflectivity
+    float nrm[3];  float matId;         // vec4: xyz normal,   w material id
+    float col[3];  float _pad;          // vec4: xyz colour,   w unused
 };
 
 struct UBO {
     Mat4     viewInverse;
     Mat4     projInverse;
-    Mat4     prevViewProj;
-    float    lightPos[4];   // xyz = position, w = radius
-    float    prevCamPos[4]; // xyz = previous camera position, w = TAA blend alpha
-    float    params[4];     // x = time, y = maxBounces, z = intensity, w = samples/frame
-    uint32_t frame[4];      // y = free-running frame, z = historyValid, w = parity
-    float    lens[4];       // x = aperture radius, y = focus distance, z = exposure, w = unused
+    float    lightPos[4];  // xyz = position, w = radius (area light)
+    float    params[4];    // x = time, y = maxBounces, z = light intensity, w = samples/frame
+    uint32_t frame[4];     // x = accumulated frame index
 };
 
 // -----------------------------------------------------------------------------
@@ -251,31 +233,11 @@ private:
     Buffer vertexBuffer, indexBuffer, ubo;
     uint32_t indexCount = 0;
 
-    // ---- Animated scene ----
-    struct SceneObject {
-        std::vector<Vertex> base;   // local-space vertices (pos/normal in local frame)
-        uint32_t vertexOffset = 0;  // where this object's verts live in the merged buffer
-        Vec3  orbitCenter{};
-        float orbitRadius = 0, orbitSpeed = 0, orbitPhase = 0;
-        Vec3  spinAxis{ 0, 1, 0 };
-        float spinSpeed = 0;
-        bool  isLight = false;      // follows the moving light position
-        Mat3  prevRot{};            // transform from the previous frame (motion vectors)
-        Vec3  prevPos{};
-        bool  prevInit = false;
-    };
-    std::vector<SceneObject> objects;
-    std::vector<Vertex>   sceneVerts;     // merged, rewritten each frame
-    std::vector<uint32_t> sceneIndices;   // merged, static topology
-    uint32_t totalVerts = 0;
-    Vec3 curLightPos{ 4, 7, -2 };
-
-    // ---- Acceleration structures (rebuilt each frame) ----
+    // ---- Acceleration structures ----
     VkAccelerationStructureKHR blas = VK_NULL_HANDLE; Buffer blasBuffer;
     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE; Buffer tlasBuffer;
-    Buffer asScratch, asInstance;
-    VkAccelerationStructureGeometryKHR blasGeom{};
-    VkAccelerationStructureGeometryKHR tlasGeom{};
+    Buffer asScratch, asInstance;                       // persistent, for per-frame rebuild
+    VkAccelerationStructureGeometryKHR blasGeom{}, tlasGeom{};
     uint32_t blasTriCount = 0;
 
     // ---- Output storage image (rgba8, blitted to the swapchain) ----
@@ -283,29 +245,15 @@ private:
     VkDeviceMemory storageMem   = VK_NULL_HANDLE;
     VkImageView    storageView  = VK_NULL_HANDLE;
 
-    // ---- TAA history (rgba32f, ping-pong; rgb = colour, a = distance key) ----
-    VkImage        histImg[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory histMem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImageView    histView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    // ---- Accumulation image (rgba32f, persists across frames) ----
+    VkImage        accumImage = VK_NULL_HANDLE;
+    VkDeviceMemory accumMem   = VK_NULL_HANDLE;
+    VkImageView    accumView  = VK_NULL_HANDLE;
 
-    // ---- Denoiser: ping-pong colour (rgba32f) + guide (xyz normal, w depth) ----
-    VkImage        denImg[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory denMem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImageView    denView[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImage        guideImg = VK_NULL_HANDLE;
-    VkDeviceMemory guideMem = VK_NULL_HANDLE;
-    VkImageView    guideView = VK_NULL_HANDLE;
-    int            atrousPasses = 3;   // 0 = denoiser off (tone-map only), 3 = full
-
-    VkDescriptorSetLayout compDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet       compSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout      compPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            compPipeline = VK_NULL_HANDLE;
-
-    // Previous-frame camera state for reprojection.
-    Mat4 prevViewProj{};
-    Vec3 prevCamPos{};
-    bool haveHistory = false;
+    // ---- History image (rgba32f): xyz = previous primary-hit world pos (for motion test) ----
+    VkImage        histImage = VK_NULL_HANDLE;
+    VkDeviceMemory histMem   = VK_NULL_HANDLE;
+    VkImageView    histView  = VK_NULL_HANDLE;
 
     // ---- Pipeline ----
     VkDescriptorSetLayout descLayout = VK_NULL_HANDLE;
@@ -421,7 +369,6 @@ private:
         createDescriptors();
         createRayTracingPipeline();
         createShaderBindingTable();
-        createComputePipeline();
         startTime = std::chrono::high_resolution_clock::now();
     }
 
@@ -725,48 +672,100 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    //  Procedural meshes (local space, centred at the origin)
+    //  Scene geometry (built procedurally, baked into world space)
     // -------------------------------------------------------------------------
-    static void pushV(std::vector<Vertex>& V, Vec3 p, Vec3 n, Vec3 c, float refl, float mat) {
-        Vertex v{};
-        v.pos[0] = p.x; v.pos[1] = p.y; v.pos[2] = p.z; v.reflectivity = refl;
-        v.nrm[0] = n.x; v.nrm[1] = n.y; v.nrm[2] = n.z; v.matId = mat;
-        v.col[0] = c.x; v.col[1] = c.y; v.col[2] = c.z; v.texId = 0.0f;
-        v.loc[0] = p.x; v.loc[1] = p.y; v.loc[2] = p.z; v.bump = 0.0f; // object-space copy
-        v.prv[0] = p.x; v.prv[1] = p.y; v.prv[2] = p.z; v.emissive = 0.0f;
-        V.push_back(v);
-    }
+    std::vector<Vertex> sceneVerts;
+    std::vector<uint32_t> sceneIndices;
 
-    static void setTexture(std::vector<Vertex>& V, float texId, float bump) {
-        for (auto& v : V) { v.texId = texId; v.bump = bump; }
-    }
-    static void setEmissive(std::vector<Vertex>& V, float strength) {
-        for (auto& v : V) v.emissive = strength;
-    }
-
-    static void genSphere(std::vector<Vertex>& V, std::vector<uint32_t>& I, float radius,
-                          Vec3 col, float refl, float mat, int stacks = 24, int slices = 48) {
-        const float PI = 3.14159265358979f;
-        uint32_t base = (uint32_t)V.size();
+    void addSphere(Vec3 center, float radius, Vec3 color, float reflectivity, float matId = 1.0f, int stacks = 24, int slices = 48) {
+        uint32_t base = (uint32_t)sceneVerts.size();
         for (int i = 0; i <= stacks; ++i) {
-            float phi = (float)i / stacks * PI;
+            float v = (float)i / stacks;
+            float phi = v * 3.14159265f;           // 0..pi
             for (int j = 0; j <= slices; ++j) {
-                float th = (float)j / slices * 2.0f * PI;
-                Vec3 n{ std::sin(phi) * std::cos(th), std::cos(phi), std::sin(phi) * std::sin(th) };
-                pushV(V, n * radius, n, col, refl, mat);
+                float u = (float)j / slices;
+                float theta = u * 2.0f * 3.14159265f; // 0..2pi
+                Vec3 n{ std::sin(phi) * std::cos(theta),
+                        std::cos(phi),
+                        std::sin(phi) * std::sin(theta) };
+                Vec3 p = center + n * radius;
+                Vertex vert{};
+                vert.pos[0] = p.x; vert.pos[1] = p.y; vert.pos[2] = p.z; vert.reflectivity = reflectivity;
+                vert.nrm[0] = n.x; vert.nrm[1] = n.y; vert.nrm[2] = n.z; vert.matId = matId;
+                vert.col[0] = color.x; vert.col[1] = color.y; vert.col[2] = color.z;
+                sceneVerts.push_back(vert);
             }
         }
         int ring = slices + 1;
-        for (int i = 0; i < stacks; ++i)
+        for (int i = 0; i < stacks; ++i) {
             for (int j = 0; j < slices; ++j) {
-                uint32_t a = base + i * ring + j, b = base + (i + 1) * ring + j;
-                I.push_back(a); I.push_back(b); I.push_back(a + 1);
-                I.push_back(a + 1); I.push_back(b); I.push_back(b + 1);
+                uint32_t a = base + i * ring + j;
+                uint32_t b = base + (i + 1) * ring + j;
+                sceneIndices.push_back(a);     sceneIndices.push_back(b);     sceneIndices.push_back(a + 1);
+                sceneIndices.push_back(a + 1); sceneIndices.push_back(b);     sceneIndices.push_back(b + 1);
             }
+        }
     }
 
-    static void genBox(std::vector<Vertex>& V, std::vector<uint32_t>& I, float s,
-                       Vec3 col, float refl, float mat) {
+    void addFloor(float half, float reflectivity) {
+        uint32_t base = (uint32_t)sceneVerts.size();
+        Vec3 n{ 0, 1, 0 };
+        Vec3 corners[4] = {
+            { -half, 0, -half }, {  half, 0, -half },
+            {  half, 0,  half }, { -half, 0,  half }
+        };
+        for (auto& c : corners) {
+            Vertex vert{};
+            vert.pos[0] = c.x; vert.pos[1] = c.y; vert.pos[2] = c.z; vert.reflectivity = reflectivity;
+            vert.nrm[0] = n.x; vert.nrm[1] = n.y; vert.nrm[2] = n.z; vert.matId = 0.0f; // 0 = floor
+            vert.col[0] = 0.8f; vert.col[1] = 0.8f; vert.col[2] = 0.8f;
+            sceneVerts.push_back(vert);
+        }
+        sceneIndices.push_back(base + 0); sceneIndices.push_back(base + 1); sceneIndices.push_back(base + 2);
+        sceneIndices.push_back(base + 0); sceneIndices.push_back(base + 2); sceneIndices.push_back(base + 3);
+    }
+
+    // -------------------------------------------------------------------------
+    //  Vertex push + procedural shapes (faceted gem, cube) and morphing grids
+    // -------------------------------------------------------------------------
+    void pushVert(Vec3 p, Vec3 n, Vec3 col, float refl, float mat) {
+        Vertex v{};
+        v.pos[0] = p.x; v.pos[1] = p.y; v.pos[2] = p.z; v.reflectivity = refl;
+        v.nrm[0] = n.x; v.nrm[1] = n.y; v.nrm[2] = n.z; v.matId = mat;
+        v.col[0] = col.x; v.col[1] = col.y; v.col[2] = col.z;
+        sceneVerts.push_back(v);
+    }
+
+    // Faceted brilliant-cut gem (flat facets -> sparkle). Static.
+    void addDiamond(Vec3 center, float s, Vec3 col, float mat, int N = 16) {
+        const float PI = 3.14159265358979f;
+        const float rt = 0.50f, ht = 0.42f, rg = 1.00f, hp = 1.15f;
+        Vec3 c0{ 0, (ht - hp) * 0.5f * s, 0 };
+        auto T = [&](int i) { float a = (float)((i % N + N) % N) * 2 * PI / N;
+                              return Vec3{ rt * std::cos(a) * s, ht * s, rt * std::sin(a) * s }; };
+        auto G = [&](int i) { float a = ((float)((i % N + N) % N) + 0.5f) * 2 * PI / N;
+                              return Vec3{ rg * std::cos(a) * s, 0.0f, rg * std::sin(a) * s }; };
+        Vec3 Tc{ 0, ht * s, 0 }, C{ 0, -hp * s, 0 };
+        auto face = [&](Vec3 a, Vec3 b, Vec3 cc) {
+            Vec3 nn = normalize(cross(b - a, cc - a));
+            Vec3 cen = (a + b + cc) * (1.0f / 3.0f);
+            if (dot(nn, cen - c0) < 0.0f) nn = nn * -1.0f;
+            uint32_t t = (uint32_t)sceneVerts.size();
+            pushVert(a + center, nn, col, 0.0f, mat);
+            pushVert(b + center, nn, col, 0.0f, mat);
+            pushVert(cc + center, nn, col, 0.0f, mat);
+            sceneIndices.push_back(t); sceneIndices.push_back(t + 1); sceneIndices.push_back(t + 2);
+        };
+        for (int i = 0; i < N; ++i) {
+            face(Tc, T(i + 1), T(i));
+            face(T(i), T(i + 1), G(i));
+            face(T(i + 1), G(i + 1), G(i));
+            face(G(i), G(i + 1), C);
+        }
+    }
+
+    // Flat-shaded cube. Static.
+    void addCube(Vec3 center, float s, Vec3 col, float mat) {
         Vec3 nrm[6] = { {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1} };
         float h = s * 0.5f;
         for (int f = 0; f < 6; ++f) {
@@ -775,201 +774,172 @@ private:
             else { u = { 0,1,0 }; w = cross(N, u); }
             Vec3 c = N * h;
             Vec3 p0 = c - u * h - w * h, p1 = c + u * h - w * h, p2 = c + u * h + w * h, p3 = c - u * h + w * h;
-            uint32_t b = (uint32_t)V.size();
-            pushV(V, p0, N, col, refl, mat); pushV(V, p1, N, col, refl, mat);
-            pushV(V, p2, N, col, refl, mat); pushV(V, p3, N, col, refl, mat);
-            I.push_back(b); I.push_back(b + 1); I.push_back(b + 2);
-            I.push_back(b); I.push_back(b + 2); I.push_back(b + 3);
+            uint32_t b = (uint32_t)sceneVerts.size();
+            pushVert(p0 + center, N, col, 0.0f, mat); pushVert(p1 + center, N, col, 0.0f, mat);
+            pushVert(p2 + center, N, col, 0.0f, mat); pushVert(p3 + center, N, col, 0.0f, mat);
+            sceneIndices.push_back(b); sceneIndices.push_back(b + 1); sceneIndices.push_back(b + 2);
+            sceneIndices.push_back(b); sceneIndices.push_back(b + 2); sceneIndices.push_back(b + 3);
         }
     }
 
-    static void genPyramid(std::vector<Vertex>& V, std::vector<uint32_t>& I, float base, float height,
-                           Vec3 col, float refl, float mat) {
-        float h = base * 0.5f;
-        Vec3 c0{ -h,0,-h }, c1{ h,0,-h }, c2{ h,0,h }, c3{ -h,0,h }, ap{ 0,height,0 };
-        uint32_t b = (uint32_t)V.size(); Vec3 nd{ 0,-1,0 };
-        pushV(V, c0, nd, col, refl, mat); pushV(V, c1, nd, col, refl, mat);
-        pushV(V, c2, nd, col, refl, mat); pushV(V, c3, nd, col, refl, mat);
-        I.push_back(b); I.push_back(b + 2); I.push_back(b + 1);
-        I.push_back(b); I.push_back(b + 3); I.push_back(b + 2);
-        Vec3 corners[4] = { c0,c1,c2,c3 };
-        for (int k = 0; k < 4; ++k) {
-            Vec3 a = corners[k], d = corners[(k + 1) % 4];
-            Vec3 N = normalize(cross(d - a, ap - a));
-            uint32_t t = (uint32_t)V.size();
-            pushV(V, a, N, col, refl, mat); pushV(V, d, N, col, refl, mat); pushV(V, ap, N, col, refl, mat);
-            I.push_back(t); I.push_back(t + 1); I.push_back(t + 2);
-        }
-    }
+    // ---- Morphing grid shapes (regenerated each frame) ----
+    struct SuperParams { float m1, n1, n2, n3, m2, q1, q2, q3; };
+    struct Morpher {
+        int kind;            // 1 = supertoroid, 2 = supershape
+        uint32_t vOffset; int U, Vr;
+        Vec3 center, spinAxis; float spinSpeed;
+    };
+    std::vector<Morpher> morphers;
 
-    static void genTetra(std::vector<Vertex>& V, std::vector<uint32_t>& I, float s,
-                         Vec3 col, float refl, float mat) {
-        Vec3 v[4] = { {1,1,1},{-1,-1,1},{-1,1,-1},{1,-1,-1} };
-        for (int i = 0; i < 4; ++i) v[i] = v[i] * (s * 0.5f);
-        int faces[4][3] = { {0,1,2},{0,3,1},{0,2,3},{1,3,2} };
-        for (int f = 0; f < 4; ++f) {
-            Vec3 a = v[faces[f][0]], b = v[faces[f][1]], c = v[faces[f][2]];
-            Vec3 N = normalize(cross(b - a, c - a));
-            if (dot(N, a) < 0) N = N * -1.0f;
-            uint32_t t = (uint32_t)V.size();
-            pushV(V, a, N, col, refl, mat); pushV(V, b, N, col, refl, mat); pushV(V, c, N, col, refl, mat);
-            I.push_back(t); I.push_back(t + 1); I.push_back(t + 2);
-        }
-    }
-
-    static void genSuperTorus(std::vector<Vertex>& V, std::vector<uint32_t>& I,
-                              float R, float r, float e, float n, int ures, int vres,
-                              Vec3 col, float refl, float mat) {
-        const float PI = 3.14159265358979f;
-        auto sp = [](float c, float p) { float s = c < 0 ? -1.f : 1.f; return s * std::pow(std::fabs(c), p); };
-        auto P = [&](int i, int j) {
-            float u = -PI + 2 * PI * (float)((i % ures + ures) % ures) / ures;
-            float v = -PI + 2 * PI * (float)((j % vres + vres) % vres) / vres;
-            float cu = std::cos(u), su = std::sin(u), cv = std::cos(v), sv = std::sin(v);
-            float a = R + r * sp(cu, e);
-            return Vec3{ a * sp(cv, n), r * sp(su, e), a * sp(sv, n) };
-        };
-        uint32_t base = (uint32_t)V.size();
-        for (int i = 0; i <= ures; ++i)
-            for (int j = 0; j <= vres; ++j) {
-                Vec3 p = P(i, j);
-                Vec3 du = P(i + 1, j) - P(i - 1, j);
-                Vec3 dv = P(i, j + 1) - P(i, j - 1);
-                Vec3 nn = normalize(cross(du, dv));
-                pushV(V, p, nn, col, refl, mat);
-            }
-        int stride = vres + 1;
-        for (int i = 0; i < ures; ++i)
-            for (int j = 0; j < vres; ++j) {
+    uint32_t genGrid(int U, int Vr, Vec3 col, float mat) {
+        uint32_t base = (uint32_t)sceneVerts.size();
+        for (int i = 0; i <= U; ++i)
+            for (int j = 0; j <= Vr; ++j) pushVert({ 0,0,0 }, { 0,1,0 }, col, 0.0f, mat);
+        int stride = Vr + 1;
+        for (int i = 0; i < U; ++i)
+            for (int j = 0; j < Vr; ++j) {
                 uint32_t a = base + i * stride + j, b = base + (i + 1) * stride + j;
-                I.push_back(a); I.push_back(b); I.push_back(a + 1);
-                I.push_back(a + 1); I.push_back(b); I.push_back(b + 1);
+                sceneIndices.push_back(a); sceneIndices.push_back(b); sceneIndices.push_back(a + 1);
+                sceneIndices.push_back(a + 1); sceneIndices.push_back(b); sceneIndices.push_back(b + 1);
+            }
+        return base;
+    }
+
+    static float superformula(float ang, float m, float n1, float n2, float n3) {
+        float t = m * ang * 0.25f;
+        float c = std::pow(std::fabs(std::cos(t)), n2);
+        float s = std::pow(std::fabs(std::sin(t)), n3);
+        float b = c + s; if (b < 1e-9f) b = 1e-9f;
+        float r = std::pow(b, -1.0f / n1);
+        return r > 6.0f ? 6.0f : r;
+    }
+    // Curated, robust presets; the morph lerps between them (always a clean body).
+    SuperParams morphParams(float t) {
+        static const SuperParams ps[] = {
+            { 0,1,1,1, 0,1,1,1 },   // sphere
+            { 4,6,6,6, 4,6,6,6 },   // rounded cube
+            { 2,5,5,5, 2,5,5,5 },   // gentle pillow
+            { 6,5,5,5, 6,5,5,5 },   // soft 6-lobe (rounded, no deep valleys)
+        };
+        const int N = 4; const float per = 4.5f;
+        float x = t / per; int i = ((int)x) % N, j = (i + 1) % N;
+        float f = x - std::floor(x); f = f * f * (3 - 2 * f);
+        auto L = [&](float A, float B) { return A + (B - A) * f; };
+        const SuperParams& A = ps[i]; const SuperParams& B = ps[j];
+        return { L(A.m1,B.m1), L(A.n1,B.n1), L(A.n2,B.n2), L(A.n3,B.n3),
+                 L(A.m2,B.m2), L(A.q1,B.q1), L(A.q2,B.q2), L(A.q3,B.q3) };
+    }
+
+    template <class Fn>
+    void writeGrid(uint32_t vOffset, int U, int Vr, const Mat3& R, Vec3 center,
+                   float scale, bool outward, Fn pos) {
+        int stride = Vr + 1;
+        for (int i = 0; i <= U; ++i)
+            for (int j = 0; j <= Vr; ++j) {
+                Vec3 p = pos(i, j);
+                Vec3 du = pos(i + 1, j) - pos(i - 1, j);
+                Vec3 dv = pos(i, j + 1) - pos(i, j - 1);
+                Vec3 nn = cross(du, dv);
+                float nl = std::sqrt(dot(nn, nn));
+                nn = (nl > 1e-5f) ? nn * (1.0f / nl) : normalize(p); // pole: fall back to radial
+                if (outward && dot(nn, p) < 0.0f) nn = nn * -1.0f;
+                Vec3 wp = mul3(R, p * scale) + center;
+                Vec3 wn = mul3(R, nn);
+                Vertex& vv = sceneVerts[vOffset + i * stride + j];
+                vv.pos[0] = wp.x; vv.pos[1] = wp.y; vv.pos[2] = wp.z;
+                vv.nrm[0] = wn.x; vv.nrm[1] = wn.y; vv.nrm[2] = wn.z;
             }
     }
 
-    static void genFloor(std::vector<Vertex>& V, std::vector<uint32_t>& I, float half, float refl) {
-        Vec3 n{ 0,1,0 }; Vec3 col{ 0.8f,0.8f,0.8f };
-        Vec3 c[4] = { {-half,0,-half},{half,0,-half},{half,0,half},{-half,0,half} };
-        uint32_t b = (uint32_t)V.size();
-        for (auto& cc : c) pushV(V, cc, n, col, refl, 0.0f);
-        I.push_back(b); I.push_back(b + 1); I.push_back(b + 2);
-        I.push_back(b); I.push_back(b + 2); I.push_back(b + 3);
+    void fillMorpher(const Morpher& mo, float t) {
+        const float PI = 3.14159265358979f;
+        Mat3 R = (mo.spinSpeed != 0.0f) ? rotAxis(mo.spinAxis, mo.spinSpeed * t) : Mat3{};
+        int U = mo.U, Vr = mo.Vr;
+        if (mo.kind == 1) {                          // supertoroid (twist + superellipse tube)
+            float n = 1.6f + 1.1f * (0.5f + 0.5f * std::sin(t * 0.22f));  // round <-> square tube
+            const float twist = 3.0f;                                    // INTEGER -> ring closes seamlessly
+            float a = 2.2f;
+            auto pos = [&](int i, int j) -> Vec3 {
+                float u = 2 * PI * (float)((i % U + U) % U) / U;
+                float v = 2 * PI * (float)((j % Vr + Vr) % Vr) / Vr;
+                float cv = std::fabs(std::cos(v)); if (cv < 1e-9f) cv = 1e-9f;
+                float sv = std::fabs(std::sin(v)); if (sv < 1e-9f) sv = 1e-9f;
+                float Rr = std::pow(std::pow(cv, n) + std::pow(sv, n), -1.0f / n);
+                float phi = twist * u + v;
+                float r = a + Rr * std::cos(phi);
+                return Vec3{ r * std::cos(u), Rr * std::sin(phi), r * std::sin(u) };
+            };
+            writeGrid(mo.vOffset, U, Vr, R, mo.center, 1.0f, false, pos);
+        } else {                                     // supershape (preset morph, size-normalised)
+            SuperParams p = morphParams(t);
+            auto pos = [&](int i, int j) -> Vec3 {
+                float th = -PI + 2 * PI * (float)((i % U + U) % U) / U;
+                float ph = -0.5f * PI + PI * (float)((j % Vr + Vr) % Vr) / Vr;
+                float r1 = superformula(th, p.m1, p.n1, p.n2, p.n3);
+                float r2 = superformula(ph, p.m2, p.q1, p.q2, p.q3);
+                return Vec3{ r1 * std::cos(th) * r2 * std::cos(ph),
+                             r2 * std::sin(ph),
+                             r1 * std::sin(th) * r2 * std::cos(ph) };
+            };
+            float maxR = 1e-6f;
+            for (int i = 0; i <= U; ++i)
+                for (int j = 0; j <= Vr; ++j) { Vec3 q = pos(i, j); float d = std::sqrt(dot(q, q)); if (d > maxR) maxR = d; }
+            writeGrid(mo.vOffset, U, Vr, R, mo.center, 2.0f / maxR, true, pos);
+        }
     }
 
-    // -------------------------------------------------------------------------
-    //  Scene assembly (object list + merged buffers)
-    // -------------------------------------------------------------------------
-    void addObject(std::vector<Vertex>& base, std::vector<uint32_t>& localIdx, SceneObject proto) {
-        proto.vertexOffset = totalVerts;
-        for (uint32_t id : localIdx) sceneIndices.push_back(proto.vertexOffset + id);
-        totalVerts += (uint32_t)base.size();
-        proto.base = std::move(base);
-        objects.push_back(std::move(proto));
+    void updateScene(float t) {
+        for (auto& mo : morphers) fillMorpher(mo, t);
+        uploadToBuffer(vertexBuffer, sceneVerts.data(), sceneVerts.size() * sizeof(Vertex));
     }
 
     void createScene() {
-        const float PI = 3.14159265358979f;
+        const int U = 120, Vr = 60;
+        addFloor(20.0f, 0.4f);
 
-        // Floor (static, checker texture).
-        { std::vector<Vertex> v; std::vector<uint32_t> idx; genFloor(v, idx, 22.0f, 0.35f);
-          setTexture(v, 1.0f, 0.0f);
-          SceneObject o; addObject(v, idx, o); }
+        // Morphing supertoroid -- clear glass, tumbling so the twist reads.
+        { uint32_t off = genGrid(U, Vr, { 1.0f, 1.0f, 1.0f }, 2.0f);
+          morphers.push_back({ 1, off, U, Vr, { 0.0f, 2.7f, 0.0f }, { 1.0f, 0.25f, 0.35f }, 0.5f }); }
 
-        // Central super-torus: iridescent metal (rainbow sheen that shifts with angle).
-        { std::vector<Vertex> v; std::vector<uint32_t> idx;
-          genSuperTorus(v, idx, 2.0f, 0.62f, 0.6f, 0.6f, 72, 36, { 0.85f,0.78f,0.70f }, 0.40f, 4.0f);
-          SceneObject o; o.orbitCenter = { 0,1.9f,0 }; o.spinAxis = { 0.25f,1.0f,0.0f }; o.spinSpeed = 0.5f;
-          addObject(v, idx, o); }
+        // Morphing supershape -- neutral cool glass, slow spin.
+        { uint32_t off = genGrid(U, Vr, { 0.85f, 0.90f, 0.97f }, 2.0f);
+          morphers.push_back({ 2, off, U, Vr, { -5.6f, 2.4f, -1.0f }, { 0.0f, 1.0f, 0.2f }, 0.55f }); }
 
-        // Ring of mixed shapes, each spinning, the whole ring orbiting slowly.
-        const int N = 6;
-        for (int i = 0; i < N; ++i) {
-            float phase = (float)i / N * 2.0f * PI;
-            std::vector<Vertex> v; std::vector<uint32_t> idx;
-            SceneObject o;
-            o.orbitCenter = { 0,1.35f,0 }; o.orbitRadius = 4.8f; o.orbitSpeed = 0.13f; o.orbitPhase = phase;
-            switch (i) {
-            case 0: genBox(v, idx, 1.3f, { 0.70f,0.45f,0.25f }, 0.08f, 1.0f);       // wood
-                    setTexture(v, 3.0f, 0.0f);
-                    o.spinAxis = { 0.3f,1,0.2f }; o.spinSpeed = 0.9f; break;
-            case 1: genPyramid(v, idx, 1.5f, 1.7f, { 0.55f,0.55f,0.58f }, 0.08f, 1.0f); // granite
-                    setTexture(v, 4.0f, 0.30f);
-                    o.spinAxis = { 0,1,0 }; o.spinSpeed = 0.8f; break;
-            case 2: genTetra(v, idx, 1.7f, { 0.85f,0.80f,0.75f }, 0.12f, 1.0f);     // marble
-                    setTexture(v, 2.0f, 0.12f);
-                    o.spinAxis = { 0.4f,1,0.1f }; o.spinSpeed = 1.1f; break;
-            case 3: genSphere(v, idx, 0.85f, { 1.0f,1.0f,1.0f }, 0.0f, 2.0f);       // glass (dispersion)
-                    o.spinSpeed = 0.0f; break;
-            case 4: genSphere(v, idx, 0.85f, { 0.20f,0.80f,1.00f }, 0.0f, 1.0f);   // emissive plasma
-                    setEmissive(v, 2.5f);
-                    o.spinAxis = { 0,1,0 }; o.spinSpeed = 0.25f; break;
-            default: genSphere(v, idx, 0.85f, { 0.65f,0.42f,0.20f }, 0.08f, 1.0f);  // wood
-                    setTexture(v, 3.0f, 0.0f);
-                    o.spinAxis = { 0,1,0 }; o.spinSpeed = 0.25f; break;
-            }
-            addObject(v, idx, o);
-        }
+        // Static glass pieces.
+        addSphere({ 5.6f, 1.4f, -0.3f }, 1.4f, { 1.0f, 1.0f, 1.0f }, 0.0f, 2.0f);   // clear glass sphere
+        addDiamond({ 2.8f, 1.5f, 3.2f }, 1.3f, { 1.0f, 1.0f, 1.0f }, 2.0f, 16);      // clear faceted gem
+        addCube({ -3.2f, 1.0f, 3.0f }, 2.0f, { 0.80f, 0.95f, 0.88f }, 2.0f);         // soft green glass cube
 
-        // Moving area light (emissive). Follows curLightPos.
-        { std::vector<Vertex> v; std::vector<uint32_t> idx;
-          genSphere(v, idx, 1.2f, { 1.0f,0.95f,0.85f }, 0.0f, 3.0f, 16, 32);
-          SceneObject o; o.isLight = true; addObject(v, idx, o); }
+        // Visible area light (emissive). Radius must match lightPos[3] in updateUniforms.
+        addSphere({ 4.0f, 7.0f, -2.0f }, 1.2f, { 1.0f, 0.95f, 0.85f }, 0.0f, 3.0f);
 
         indexCount = (uint32_t)sceneIndices.size();
-        sceneVerts.resize(totalVerts);
 
         VkBufferUsageFlags geomUsage =
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-        vertexBuffer = createBuffer(totalVerts * sizeof(Vertex), geomUsage,
+
+        VkDeviceSize vsize = sceneVerts.size() * sizeof(Vertex);
+        VkDeviceSize isize = sceneIndices.size() * sizeof(uint32_t);
+
+        vertexBuffer = createBuffer(vsize, geomUsage,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        indexBuffer = createBuffer(sceneIndices.size() * sizeof(uint32_t), geomUsage,
+        indexBuffer = createBuffer(isize, geomUsage,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        uploadToBuffer(indexBuffer, sceneIndices.data(), sceneIndices.size() * sizeof(uint32_t));
 
-        updateScene(0.0f); // fill + upload initial vertex positions
+        uploadToBuffer(vertexBuffer, sceneVerts.data(), vsize);
+        uploadToBuffer(indexBuffer, sceneIndices.data(), isize);
 
-        std::printf("Scene: %u objects, %u vertices, %u triangles\n",
-            (uint32_t)objects.size(), totalVerts, indexCount / 3);
-    }
+        updateScene(0.0f);   // fill the morphing grids before the first AS build
 
-    // Recompute world-space vertices for the current time and upload them.
-    void updateScene(float t) {
-        curLightPos = { std::cos(t * 0.35f) * 6.0f, 7.0f, std::sin(t * 0.35f) * 6.0f };
-
-        for (auto& o : objects) {
-            Mat3 R; // identity by default
-            if (o.spinSpeed != 0.0f) R = rotAxis(o.spinAxis, o.spinSpeed * t);
-            Vec3 pos;
-            if (o.isLight) pos = curLightPos;
-            else pos = o.orbitCenter + Vec3{ std::cos(o.orbitSpeed * t + o.orbitPhase) * o.orbitRadius,
-                                             0.0f,
-                                             std::sin(o.orbitSpeed * t + o.orbitPhase) * o.orbitRadius };
-
-            // Previous-frame transform (for motion vectors). Identity on first frame.
-            Mat3 Rp = o.prevInit ? o.prevRot : R;
-            Vec3 pp = o.prevInit ? o.prevPos : pos;
-
-            for (size_t k = 0; k < o.base.size(); ++k) {
-                const Vertex& bv = o.base[k];
-                Vec3 lp{ bv.loc[0], bv.loc[1], bv.loc[2] };
-                Vec3 ln{ bv.nrm[0], bv.nrm[1], bv.nrm[2] };
-                Vec3 wp = mul3(R, lp) + pos;
-                Vec3 wn = mul3(R, ln);
-                Vec3 pw = mul3(Rp, lp) + pp;          // previous world position
-                Vertex& dv = sceneVerts[o.vertexOffset + k];
-                dv = bv;
-                dv.pos[0] = wp.x; dv.pos[1] = wp.y; dv.pos[2] = wp.z;
-                dv.nrm[0] = wn.x; dv.nrm[1] = wn.y; dv.nrm[2] = wn.z;
-                dv.prv[0] = pw.x; dv.prv[1] = pw.y; dv.prv[2] = pw.z;
-            }
-            o.prevRot = R; o.prevPos = pos; o.prevInit = true;
-        }
-        uploadToBuffer(vertexBuffer, sceneVerts.data(), totalVerts * sizeof(Vertex));
+        std::printf("Scene: %zu vertices, %u triangles\n", sceneVerts.size(), indexCount / 3);
     }
 
     // -------------------------------------------------------------------------
-    //  Acceleration structures (created once, rebuilt every frame)
+    //  Bottom-level acceleration structure
+    // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    //  Acceleration structures: created once, rebuilt every frame (dynamic geometry)
     // -------------------------------------------------------------------------
     void createAccelStructures() {
         blasTriCount = indexCount / 3;
@@ -981,7 +951,7 @@ private:
         blasGeom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
         blasGeom.geometry.triangles.vertexData.deviceAddress = bufferAddress(vertexBuffer.buf);
         blasGeom.geometry.triangles.vertexStride = sizeof(Vertex);
-        blasGeom.geometry.triangles.maxVertex = totalVerts - 1;
+        blasGeom.geometry.triangles.maxVertex = (uint32_t)sceneVerts.size() - 1;
         blasGeom.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
         blasGeom.geometry.triangles.indexData.deviceAddress = bufferAddress(indexBuffer.buf);
 
@@ -1004,7 +974,6 @@ private:
 
         VkDeviceSize scratchSize = bs.buildScratchSize;
 
-        // Instance referencing the BLAS (identity transform).
         VkAccelerationStructureDeviceAddressInfoKHR addrInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
         addrInfo.accelerationStructure = blas;
         VkDeviceAddress blasAddr = pvkGetAccelerationStructureDeviceAddress(dev, &addrInfo);
@@ -1047,7 +1016,7 @@ private:
         if (ts.buildScratchSize > scratchSize) scratchSize = ts.buildScratchSize;
         asScratch = createBuffer(scratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        rebuildAccel(); // initial build so the TLAS is valid before the first trace
+        rebuildAccel();
     }
 
     void rebuildAccel() {
@@ -1117,82 +1086,59 @@ private:
         vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCheck(vkCreateImageView(dev, &vci, nullptr, &storageView), "storage view");
 
-        // ---- TAA history images (float, ping-pong, kept in GENERAL) ----
-        for (int i = 0; i < 2; ++i) {
-            VkImageCreateInfo aci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            aci.imageType = VK_IMAGE_TYPE_2D;
-            aci.format = VK_FORMAT_R32G32B32A32_SFLOAT;  // matches rgba32f in the shader
-            aci.extent = { swapExtent.width, swapExtent.height, 1 };
-            aci.mipLevels = 1;
-            aci.arrayLayers = 1;
-            aci.samples = VK_SAMPLE_COUNT_1_BIT;
-            aci.tiling = VK_IMAGE_TILING_OPTIMAL;
-            aci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-            aci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            vkCheck(vkCreateImage(dev, &aci, nullptr, &histImg[i]), "create hist image");
+        // ---- Accumulation image (float, kept in GENERAL layout permanently) ----
+        VkImageCreateInfo aci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        aci.imageType = VK_IMAGE_TYPE_2D;
+        aci.format = VK_FORMAT_R32G32B32A32_SFLOAT;  // matches rgba32f in the shader
+        aci.extent = { swapExtent.width, swapExtent.height, 1 };
+        aci.mipLevels = 1;
+        aci.arrayLayers = 1;
+        aci.samples = VK_SAMPLE_COUNT_1_BIT;
+        aci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        aci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        aci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vkCheck(vkCreateImage(dev, &aci, nullptr, &accumImage), "create accum image");
 
-            VkMemoryRequirements areq;
-            vkGetImageMemoryRequirements(dev, histImg[i], &areq);
-            VkMemoryAllocateInfo aai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            aai.allocationSize = areq.size;
-            aai.memoryTypeIndex = findMemoryType(areq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkCheck(vkAllocateMemory(dev, &aai, nullptr, &histMem[i]), "alloc hist image");
-            vkBindImageMemory(dev, histImg[i], histMem[i], 0);
+        VkMemoryRequirements areq;
+        vkGetImageMemoryRequirements(dev, accumImage, &areq);
+        VkMemoryAllocateInfo aai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        aai.allocationSize = areq.size;
+        aai.memoryTypeIndex = findMemoryType(areq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkCheck(vkAllocateMemory(dev, &aai, nullptr, &accumMem), "alloc accum image");
+        vkBindImageMemory(dev, accumImage, accumMem, 0);
 
-            VkImageViewCreateInfo avci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            avci.image = histImg[i];
-            avci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            avci.format = aci.format;
-            avci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCheck(vkCreateImageView(dev, &avci, nullptr, &histView[i]), "hist view");
+        VkImageViewCreateInfo avci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        avci.image = accumImage;
+        avci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        avci.format = aci.format;
+        avci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCheck(vkCreateImageView(dev, &avci, nullptr, &accumView), "accum view");
 
-            VkCommandBuffer c = beginOneShot();
-            imageBarrier(c, histImg[i],
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-            endOneShot(c);
-        }
+        // ---- History image (same format/size as accum) ----
+        VkImageCreateInfo hci = aci;
+        vkCheck(vkCreateImage(dev, &hci, nullptr, &histImage), "create hist image");
+        VkMemoryRequirements hreq;
+        vkGetImageMemoryRequirements(dev, histImage, &hreq);
+        VkMemoryAllocateInfo hai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        hai.allocationSize = hreq.size;
+        hai.memoryTypeIndex = findMemoryType(hreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkCheck(vkAllocateMemory(dev, &hai, nullptr, &histMem), "alloc hist image");
+        vkBindImageMemory(dev, histImage, histMem, 0);
+        VkImageViewCreateInfo hvci = avci;
+        hvci.image = histImage;
+        vkCheck(vkCreateImageView(dev, &hvci, nullptr, &histView), "hist view");
 
-        // ---- Denoiser images (float, GENERAL): two colour buffers + one guide ----
-        VkImage* dimgs[3] = { &denImg[0], &denImg[1], &guideImg };
-        VkDeviceMemory* dmems[3] = { &denMem[0], &denMem[1], &guideMem };
-        VkImageView* dviews[3] = { &denView[0], &denView[1], &guideView };
-        for (int i = 0; i < 3; ++i) {
-            VkImageCreateInfo dci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            dci.imageType = VK_IMAGE_TYPE_2D;
-            dci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-            dci.extent = { swapExtent.width, swapExtent.height, 1 };
-            dci.mipLevels = 1;
-            dci.arrayLayers = 1;
-            dci.samples = VK_SAMPLE_COUNT_1_BIT;
-            dci.tiling = VK_IMAGE_TILING_OPTIMAL;
-            dci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-            dci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            vkCheck(vkCreateImage(dev, &dci, nullptr, dimgs[i]), "create denoise image");
-
-            VkMemoryRequirements dreq;
-            vkGetImageMemoryRequirements(dev, *dimgs[i], &dreq);
-            VkMemoryAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            dai.allocationSize = dreq.size;
-            dai.memoryTypeIndex = findMemoryType(dreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkCheck(vkAllocateMemory(dev, &dai, nullptr, dmems[i]), "alloc denoise image");
-            vkBindImageMemory(dev, *dimgs[i], *dmems[i], 0);
-
-            VkImageViewCreateInfo dvci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            dvci.image = *dimgs[i];
-            dvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            dvci.format = dci.format;
-            dvci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCheck(vkCreateImageView(dev, &dvci, nullptr, dviews[i]), "denoise view");
-
-            VkCommandBuffer c = beginOneShot();
-            imageBarrier(c, *dimgs[i],
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-            endOneShot(c);
-        }
+        // One-time transition to GENERAL; the images then stay in GENERAL.
+        VkCommandBuffer c = beginOneShot();
+        imageBarrier(c, accumImage,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+        imageBarrier(c, histImage,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+        endOneShot(c);
     }
 
     void createUniformBuffer() {
@@ -1204,7 +1150,7 @@ private:
     //  Descriptors
     // -------------------------------------------------------------------------
     void createDescriptors() {
-        std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
@@ -1212,32 +1158,20 @@ private:
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr };
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
-        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr };
 
         VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         lci.bindingCount = (uint32_t)bindings.size();
         lci.pBindings = bindings.data();
         vkCheck(vkCreateDescriptorSetLayout(dev, &lci, nullptr, &descLayout), "descriptor layout");
 
-        // Compute (denoiser) layout: colorIn, colorOut, guide, outLDR + push constant.
-        std::array<VkDescriptorSetLayoutBinding, 4> cb{};
-        cb[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        cb[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        cb[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        cb[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        VkDescriptorSetLayoutCreateInfo clci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        clci.bindingCount = (uint32_t)cb.size();
-        clci.pBindings = cb.data();
-        vkCheck(vkCreateDescriptorSetLayout(dev, &clci, nullptr, &compDescLayout), "compute descriptor layout");
-
         std::array<VkDescriptorPoolSize, 4> sizes{ {
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 },   // RT(4) + 2 compute sets(4 each)
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
         } };
         VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        pci.maxSets = 3;   // 1 RT set + 2 compute sets
+        pci.maxSets = 1;
         pci.poolSizeCount = (uint32_t)sizes.size();
         pci.pPoolSizes = sizes.data();
         vkCheck(vkCreateDescriptorPool(dev, &pci, nullptr, &descPool), "descriptor pool");
@@ -1255,25 +1189,22 @@ private:
         asWrite.pAccelerationStructures = &tlas;
 
         VkDescriptorImageInfo imgInfo{};
-        imgInfo.imageView = denView[0];   // ray-gen writes linear HDR here for the denoiser
+        imgInfo.imageView = storageView;
         imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkDescriptorImageInfo guideInfo{};
-        guideInfo.imageView = guideView;
-        guideInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo accumInfo{};
+        accumInfo.imageView = accumView;
+        accumInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkDescriptorImageInfo histInfo0{};
-        histInfo0.imageView = histView[0];
-        histInfo0.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo histInfo1{};
-        histInfo1.imageView = histView[1];
-        histInfo1.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo histInfo{};
+        histInfo.imageView = histView;
+        histInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorBufferInfo uboInfo{ ubo.buf, 0, sizeof(UBO) };
         VkDescriptorBufferInfo vInfo{ vertexBuffer.buf, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo iInfo{ indexBuffer.buf, 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 8> writes{};
+        std::array<VkWriteDescriptorSet, 7> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[0].pNext = &asWrite;
         writes[0].dstSet = descSet; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
@@ -1297,51 +1228,13 @@ private:
 
         writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[5].dstSet = descSet; writes[5].dstBinding = 5; writes[5].descriptorCount = 1;
-        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[5].pImageInfo = &histInfo0;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[5].pImageInfo = &accumInfo;
 
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[6].dstSet = descSet; writes[6].dstBinding = 6; writes[6].descriptorCount = 1;
-        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[6].pImageInfo = &histInfo1;
-
-        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[7].dstSet = descSet; writes[7].dstBinding = 7; writes[7].descriptorCount = 1;
-        writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[7].pImageInfo = &guideInfo;
+        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[6].pImageInfo = &histInfo;
 
         vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
-
-        // ---- Compute (denoiser) descriptor sets: two for ping-pong ----
-        VkDescriptorSetLayout cl[2] = { compDescLayout, compDescLayout };
-        VkDescriptorSetAllocateInfo cai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        cai.descriptorPool = descPool;
-        cai.descriptorSetCount = 2;
-        cai.pSetLayouts = cl;
-        vkCheck(vkAllocateDescriptorSets(dev, &cai, compSet), "alloc compute sets");
-
-        VkDescriptorImageInfo den0{ VK_NULL_HANDLE, denView[0], VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo den1{ VK_NULL_HANDLE, denView[1], VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo gInf{ VK_NULL_HANDLE, guideView,  VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo ldr { VK_NULL_HANDLE, storageView, VK_IMAGE_LAYOUT_GENERAL };
-        // set 0: in = den0, out = den1 ; set 1: in = den1, out = den0
-        VkDescriptorImageInfo* inInfo[2]  = { &den0, &den1 };
-        VkDescriptorImageInfo* outInfo[2] = { &den1, &den0 };
-
-        std::array<VkWriteDescriptorSet, 8> cw{};
-        for (int s = 0; s < 2; ++s) {
-            int b = s * 4;
-            cw[b + 0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw[b + 0].dstSet = compSet[s]; cw[b + 0].dstBinding = 0; cw[b + 0].descriptorCount = 1;
-            cw[b + 0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 0].pImageInfo = inInfo[s];
-            cw[b + 1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw[b + 1].dstSet = compSet[s]; cw[b + 1].dstBinding = 1; cw[b + 1].descriptorCount = 1;
-            cw[b + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 1].pImageInfo = outInfo[s];
-            cw[b + 2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw[b + 2].dstSet = compSet[s]; cw[b + 2].dstBinding = 2; cw[b + 2].descriptorCount = 1;
-            cw[b + 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 2].pImageInfo = &gInf;
-            cw[b + 3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw[b + 3].dstSet = compSet[s]; cw[b + 3].dstBinding = 3; cw[b + 3].descriptorCount = 1;
-            cw[b + 3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[b + 3].pImageInfo = &ldr;
-        }
-        vkUpdateDescriptorSets(dev, (uint32_t)cw.size(), cw.data(), 0, nullptr);
     }
 
     // -------------------------------------------------------------------------
@@ -1421,39 +1314,6 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    //  Denoiser compute pipeline (a-trous wavelet filter + tone-map)
-    // -------------------------------------------------------------------------
-    struct AtrousPC { int32_t sizeX, sizeY, step, finalPass; float exposure; };
-
-    void createComputePipeline() {
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.offset = 0;
-        pcr.size = sizeof(AtrousPC);
-
-        VkPipelineLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        lci.setLayoutCount = 1;
-        lci.pSetLayouts = &compDescLayout;
-        lci.pushConstantRangeCount = 1;
-        lci.pPushConstantRanges = &pcr;
-        vkCheck(vkCreatePipelineLayout(dev, &lci, nullptr, &compPipelineLayout), "compute pipeline layout");
-
-        VkShaderModule cs = loadShader("shaders/atrous.comp.spv");
-        VkPipelineShaderStageCreateInfo st{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-        st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        st.module = cs;
-        st.pName = "main";
-
-        VkComputePipelineCreateInfo cci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cci.stage = st;
-        cci.layout = compPipelineLayout;
-        vkCheck(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cci, nullptr, &compPipeline),
-            "create compute pipeline");
-
-        vkDestroyShaderModule(dev, cs, nullptr);
-    }
-
-    // -------------------------------------------------------------------------
     //  Shader binding table
     // -------------------------------------------------------------------------
     void createShaderBindingTable() {
@@ -1508,8 +1368,14 @@ private:
     // -------------------------------------------------------------------------
     //  Per-frame
     // -------------------------------------------------------------------------
-    void updateUniforms(float t) {
-        totalFrame++;   // free-running; drives the RNG and the ping-pong parity
+    void updateUniforms() {
+        auto now = std::chrono::high_resolution_clock::now();
+        float t = std::chrono::duration<float>(now - startTime).count();
+
+        // Reset accumulation whenever the camera changed; otherwise keep adding samples.
+        if (cameraDirty) { accumFrame = 0; cameraDirty = false; }
+        else             { accumFrame++; }
+        totalFrame++;   // always advances, so the RNG keeps moving even during motion
 
         Vec3 center{ 0.0f, 1.0f, 0.0f };
         Vec3 up{ 0.0f, 1.0f, 0.0f };
@@ -1522,33 +1388,19 @@ private:
         Mat4 view = lookAtRH(eye, center, up);
         Mat4 proj = perspectiveVk(60.0f * 3.14159265f / 180.0f,
                                    (float)swapExtent.width / swapExtent.height, 0.1f, 100.0f);
-        Mat4 viewProj = mul(proj, view);
 
         UBO data{};
-        data.viewInverse  = inverse(view);
-        data.projInverse  = inverse(proj);
-        data.prevViewProj = haveHistory ? prevViewProj : viewProj;
-        data.lightPos[0] = curLightPos.x; data.lightPos[1] = curLightPos.y; data.lightPos[2] = curLightPos.z;
-        data.lightPos[3] = 1.2f;
-        Vec3 pc = haveHistory ? prevCamPos : eye;
-        data.prevCamPos[0] = pc.x; data.prevCamPos[1] = pc.y; data.prevCamPos[2] = pc.z;
-        data.prevCamPos[3] = 0.085f;  // TAA blend alpha (lower = smoother, more lag)
+        data.viewInverse = inverse(view);
+        data.projInverse = inverse(proj);
+        data.lightPos[0] = 4.0f; data.lightPos[1] = 7.0f; data.lightPos[2] = -2.0f;
+        data.lightPos[3] = 1.2f;      // light sphere radius (bigger = softer shadows)
         data.params[0] = t;
         data.params[1] = 8.0f;        // max bounces (glass needs a few)
         data.params[2] = 1.4f;        // light intensity
-        data.params[3] = 9.0f;        // samples/frame (multiple of 3 for even dispersion)
+        data.params[3] = 12.0f;        // samples/frame (multiple of 3 for even dispersion)
+        data.frame[0]  = accumFrame;
         data.frame[1]  = totalFrame;
-        data.frame[2]  = haveHistory ? 1u : 0u;   // historyValid
-        data.frame[3]  = totalFrame & 1u;         // ping-pong parity
-        data.lens[0]   = 0.0f;                     // aperture radius (0 = pinhole/sharp; >0 = DoF, noisy without a denoiser)
-        data.lens[1]   = std::sqrt(dot(eye - center, eye - center)); // focus distance (centre sharp)
-        data.lens[2]   = 1.1f;                      // exposure (pre tone-map)
         uploadToBuffer(ubo, &data, sizeof(data));
-
-        // Remember this frame's camera for the next reprojection.
-        prevViewProj = viewProj;
-        prevCamPos   = eye;
-        haveHistory  = true;
     }
 
     void imageBarrier(VkCommandBuffer c, VkImage img,
@@ -1576,27 +1428,32 @@ private:
 
         float t = std::chrono::duration<float>(
             std::chrono::high_resolution_clock::now() - startTime).count();
+        updateScene(t);     // regenerate the morphing shapes and upload vertices
+        rebuildAccel();     // rebuild BLAS/TLAS for the new geometry
 
-        updateScene(t);     // animate objects + light (CPU transform, upload vertices)
-        rebuildAccel();     // rebuild BLAS/TLAS for the new positions
-        updateUniforms(t);
+        updateUniforms();
 
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmd, &bi);
 
-        // Output (rgba8) -> GENERAL; the denoiser's final compute pass writes it.
+        // Storage image -> GENERAL for ray tracing writes.
         imageBarrier(cmd, storageImage,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
             0, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
 
-        // Make the previous frame's history writes visible to this frame's reads.
-        for (int i = 0; i < 2; ++i)
-            imageBarrier(cmd, histImg[i],
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+        // Make the previous frame's accumulation writes visible to this frame.
+        imageBarrier(cmd, accumImage,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+
+        // Same for the history image (read this frame, written last frame).
+        imageBarrier(cmd, histImage,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -1605,52 +1462,11 @@ private:
         pvkCmdTraceRays(cmd, &rgenRegion, &missRegion, &hitRegion, &callRegion,
             swapExtent.width, swapExtent.height, 1);
 
-        // ---- Denoiser: a-trous compute passes on the ray-traced result ----
-        // RT outputs (colour den[0], guide) must be visible to compute reads.
-        imageBarrier(cmd, denImg[0],
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        imageBarrier(cmd, guideImg,
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compPipeline);
-        uint32_t gx = (swapExtent.width + 7) / 8, gy = (swapExtent.height + 7) / 8;
-        float exposure = 1.1f;
-        int passes = atrousPasses;
-
-        if (passes <= 0) {
-            // Denoiser off: a single pass with step 0 = pure tone-map copy.
-            AtrousPC pc{ (int)swapExtent.width, (int)swapExtent.height, 0, 1, exposure };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                compPipelineLayout, 0, 1, &compSet[0], 0, nullptr);
-            vkCmdPushConstants(cmd, compPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(cmd, gx, gy, 1);
-        } else {
-            for (int i = 0; i < passes; ++i) {
-                int setIdx = i & 1;                 // set0 reads den0, set1 reads den1
-                int outIdx = 1 - setIdx;            // image this pass writes
-                AtrousPC pc{ (int)swapExtent.width, (int)swapExtent.height,
-                             1 << i, (i == passes - 1) ? 1 : 0, exposure };
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    compPipelineLayout, 0, 1, &compSet[setIdx], 0, nullptr);
-                vkCmdPushConstants(cmd, compPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(cmd, gx, gy, 1);
-                if (i < passes - 1)                 // make this output readable next pass
-                    imageBarrier(cmd, denImg[outIdx],
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            }
-        }
-
-        // Final compute pass wrote storageImage -> TRANSFER_SRC; swapchain -> TRANSFER_DST.
+        // Storage image -> TRANSFER_SRC, swapchain image -> TRANSFER_DST.
         imageBarrier(cmd, storageImage,
             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT);
         imageBarrier(cmd, swapImages[imageIndex],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1720,9 +1536,6 @@ private:
 
     void cleanup() {
         destroyBuffer(sbtBuffer);
-        if (compPipeline)       vkDestroyPipeline(dev, compPipeline, nullptr);
-        if (compPipelineLayout) vkDestroyPipelineLayout(dev, compPipelineLayout, nullptr);
-        if (compDescLayout)     vkDestroyDescriptorSetLayout(dev, compDescLayout, nullptr);
         if (rtPipeline)     vkDestroyPipeline(dev, rtPipeline, nullptr);
         if (pipelineLayout) vkDestroyPipelineLayout(dev, pipelineLayout, nullptr);
         if (descPool)       vkDestroyDescriptorPool(dev, descPool, nullptr);
@@ -1732,19 +1545,12 @@ private:
         if (storageImage) vkDestroyImage(dev, storageImage, nullptr);
         if (storageMem) vkFreeMemory(dev, storageMem, nullptr);
 
-        for (int i = 0; i < 2; ++i) {
-            if (histView[i]) vkDestroyImageView(dev, histView[i], nullptr);
-            if (histImg[i])  vkDestroyImage(dev, histImg[i], nullptr);
-            if (histMem[i])  vkFreeMemory(dev, histMem[i], nullptr);
-        }
-        for (int i = 0; i < 2; ++i) {
-            if (denView[i]) vkDestroyImageView(dev, denView[i], nullptr);
-            if (denImg[i])  vkDestroyImage(dev, denImg[i], nullptr);
-            if (denMem[i])  vkFreeMemory(dev, denMem[i], nullptr);
-        }
-        if (guideView) vkDestroyImageView(dev, guideView, nullptr);
-        if (guideImg)  vkDestroyImage(dev, guideImg, nullptr);
-        if (guideMem)  vkFreeMemory(dev, guideMem, nullptr);
+        if (accumView) vkDestroyImageView(dev, accumView, nullptr);
+        if (accumImage) vkDestroyImage(dev, accumImage, nullptr);
+        if (histView) vkDestroyImageView(dev, histView, nullptr);
+        if (histImage) vkDestroyImage(dev, histImage, nullptr);
+        if (accumMem) vkFreeMemory(dev, accumMem, nullptr);
+        if (histMem) vkFreeMemory(dev, histMem, nullptr);
 
         if (tlas) pvkDestroyAccelerationStructure(dev, tlas, nullptr);
         if (blas) pvkDestroyAccelerationStructure(dev, blas, nullptr);

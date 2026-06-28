@@ -9,38 +9,19 @@ software tracer.
 Zero external dependencies beyond the Vulkan SDK itself: the window is created
 with raw Win32 (no GLFW) and all math is inline (no GLM).
 
-## Screenshot
-
-![preview](screenshot.png)
+![preview](preview.png)
 
 ## Features
 
 - **Hardware ray tracing** — BLAS + TLAS, a full RT pipeline (ray generation,
   closest-hit and two miss shaders) and a correctly aligned shader binding table.
-- **Animated geometry** — procedural super-torus, box, pyramid, tetrahedron and
-  spheres, transformed on the CPU and rebuilt into the acceleration structure each
-  frame, so objects orbit and spin and the light flies around, with no input needed.
-- **Procedural textures + bump mapping** — checker, marble, wood and granite are
-  generated from value-noise in object space (so they stick to moving objects),
-  evaluated in the closest-hit shader. Granite and marble also perturb the shading
-  normal from the noise gradient for a bumpy surface.
-- **Cinematic camera** — thin-lens depth of field (the scene centre stays sharp,
-  everything else melts into bokeh, accumulated across samples and TAA) and an
-  ACES filmic tone-map over a linear-HDR pipeline, so emissive surfaces and the
-  light keep a hot coloured core instead of clipping to flat white.
-- **Spatial denoiser** — an edge-avoiding a-trous wavelet filter (SVGF-style) runs
-  as a set of compute passes after the temporal pass, guided by a normal/depth
-  buffer so it smooths noise without bleeding across geometry or shadow edges.
-  Combined with the temporal accumulation this keeps the always-animating scene
-  clean at a handful of samples per pixel.
 - **Reflections** — traced iteratively from the ray-gen shader, so
   `maxPipelineRayRecursionDepth = 1`, which every RT-capable GPU supports.
-- **Temporal reprojection (TAA) + anti-aliasing** — each frame casts several
-  jittered samples per pixel and reprojects the previous frame's result through
-  the previous camera matrix, blending the two in an exponential history buffer.
-  The image stays clean while the camera moves, not just when it is still.
-  History is rejected per pixel by a world-space distance test, so disocclusions
-  fall back to the current frame instead of smearing.
+- **Temporal accumulation + anti-aliasing** — each frame casts several jittered
+  samples per pixel (4 by default) and blends the result into an
+  `R32G32B32A32_SFLOAT` accumulation buffer. The multi-sampling keeps motion
+  smooth, and while the camera is still the image progressively refines to a
+  clean, noise-free result; it resets the moment the camera moves.
 - **Soft shadows from an area light** — the scene is lit by a spherical area
   light (a visible emissive sphere). Each shading point samples the cone the light
   subtends, so the penumbra widens with the occluder's distance, like real soft
@@ -50,10 +31,9 @@ with raw Win32 (no GLFW) and all math is inline (no GLM).
   reflection. Refraction uses a different IOR per colour channel via spectral
   (hero-wavelength) sampling, so the glass splits light into faint rainbow edges.
 
-The scene is an animated set of procedural shapes: a tumbling super-torus at the
-centre, with a cube, a pyramid, a tetrahedron and spheres (one of them glass)
-orbiting and spinning around it, lit by an area light that flies overhead.
-Everything moves on its own; the camera orbit is layered on top.
+The scene is a reflective checkerboard floor, a central glass sphere and a ring of
+six coloured spheres (some matte, some reflective), lit by a spherical area light
+that is itself visible in the scene and in reflections.
 
 ## Controls
 
@@ -63,8 +43,8 @@ Everything moves on its own; the camera orbit is layered on top.
 | Mouse wheel      | Zoom in / out                   |
 | Esc              | Quit                            |
 
-Drag to orbit; the temporal reprojection keeps the image clean during the motion
-and it refines further the instant you stop.
+Hold still for a moment and watch the image converge — that is the accumulation
+buffer averaging samples and cleaning up the soft-shadow and glass noise.
 
 ## Requirements
 
